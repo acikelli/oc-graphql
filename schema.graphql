@@ -1,0 +1,62 @@
+scalar AWSDateTime
+
+type Query {
+  getUsersByCity(city: String!): [User!]!
+    @sql_query(
+      query: "SELECT * FROM user u JOIN address a ON u.id = a.userId WHERE a.city = $args.city"
+    )
+}
+
+type Mutation {
+  addProductToFavorite(userId: ID!, productId: ID!): Product
+    @sql_query(
+      query: "INSERT INTO $virtual_table(user_favorite_products) (userId, productId) VALUES ($args.userId, $args.productId)"
+    )
+}
+
+type UserFavoriteProductConnection @resolver {
+  items: [Product!]!
+    @sql_query(
+      query: "SELECT * FROM product p JOIN user_favorite_products ufp ON p.id = ufp.productId where ufp.userId = $source.userId OFFSET $args.offset LIMIT $args.limit "
+    )
+  limit: Int! @return(value: "$args.limit")
+  offset: Int! @return(value: "$args.offset")
+  total: Int! @sql_query(query: "SELECT COUNT(*) as total FROM product")
+}
+
+type Address {
+  id: ID!
+  userId: ID!
+  user: User!
+    @sql_query(query: "SELECT * FROM user u WHERE u.id = $source.userId")
+  city: String!
+  state: String!
+  zip: String!
+  country: String!
+  addressLine1: String!
+  addressLine2: String!
+  createdAt: AWSDateTime!
+  updatedAt: AWSDateTime!
+}
+
+type Product {
+  id: ID!
+  name: String!
+  price: Float!
+  createdAt: AWSDateTime!
+  updatedAt: AWSDateTime!
+}
+
+type User {
+  id: ID!
+  name: String!
+  email: String!
+  password: String!
+  createdAt: AWSDateTime!
+  updatedAt: AWSDateTime!
+  addresses(id: ID): [Address!]
+    @sql_query(
+      query: "SELECT * FROM address a WHERE CASE WHEN $args.id IS NOT NULL THEN a.userId = $args.id ELSE TRUE END"
+    )
+  favoriteProducts(limit: Int, offset: Int): UserFavoriteProductConnection
+}
