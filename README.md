@@ -6,19 +6,19 @@ Transform your GraphQL schema into a production-ready serverless API with real-t
 
 ## Key Features
 
-### 🎯 **Automatic CRUD Generation**
+### **Automatic CRUD Generation**
 
 - Zero-config database operations for all GraphQL types
 - Single-table DynamoDB design with optimized key structure
 - Auto-generated Lambda functions with built-in security
 
-### 🔍 **SQL-First Analytics**
+### **SQL-First Analytics**
 
 - Direct SQL queries in GraphQL with `@sql_query` directive
 - Complex joins and aggregations via Amazon Athena
 - Virtual tables for many-to-many relationships
 
-### 📊 **Advanced Data Pipeline**
+### **Advanced Data Pipeline**
 
 - **Real-time Processing**: DynamoDB Streams → Python Processor → Parquet S3
 - **Native Parquet Storage**: Apache Parquet with SNAPPY compression for optimal performance
@@ -26,19 +26,19 @@ Transform your GraphQL schema into a production-ready serverless API with real-t
 - **Date Partitioning**: Automatic year/month/day partitioning for optimal query performance
 - **Cost Optimization**: 90-98% storage reduction and 99% query cost reduction
 
-### 🛡️ **Enterprise Security**
+### **Security**
 
 - Built-in SQL injection protection with automatic parameter sanitization
 - IAM role-based access control with least privilege principle
 
-### 💰 **Performance & Cost Benefits**
+### **Performance & Cost **
 
 - **Storage**: 90-98% smaller files vs traditional JSON approaches
 - **Query Speed**: 50-100x faster analytics with columnar Parquet format
 - **Query Cost**: 99% cost reduction through partition pruning and column pruning
 - **Compute**: Right-sized Lambda functions with optimized memory allocation
 
-## 📚 Comprehensive Documentation
+## Comprehensive Documentation
 
 ### 📖 **[Complete Documentation](./docs/README.md)**
 
@@ -57,7 +57,7 @@ Transform your GraphQL schema into a production-ready serverless API with real-t
 npm install -g oc-graphql
 ```
 
-### Deploy in 60 Seconds
+### Deploy in Seconds
 
 ```bash
 # 1. Create your GraphQL schema
