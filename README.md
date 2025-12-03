@@ -1,8 +1,8 @@
 # OC-GraphQL
 
-**One Command GraphQL** - Automatically generate and deploy serverless GraphQL APIs on AWS with advanced analytics capabilities.
+**A serverless GraphQL framework for AWS** - Automatically generate and deploy production-ready GraphQL APIs with advanced analytics capabilities.
 
-Transform your GraphQL schema into a production-ready serverless API with real-time data analytics powered by Apache Parquet storage for 90-98% cost reduction and 50-100x faster queries, all with a single command.
+OC-GraphQL is a framework that abstracts AWS infrastructure complexity, automatically generating and deploying complete serverless GraphQL applications. Transform your GraphQL schema into a production-ready infrastructure with real-time data analytics powered by Apache Parquet storage for 90-98% cost reduction and 50-100x faster queries, all with a single command.
 
 ## Key Features
 
@@ -110,22 +110,33 @@ GraphQL Request → AppSync → Lambda Resolvers → DynamoDB (operational)
 
 ### Generated Infrastructure
 
-- **AppSync GraphQL API** with auto-generated resolvers
-- **Lambda Functions** (5-20+ functions depending on schema complexity)
-- **DynamoDB Table** with optimized single-table design
-- **S3 Data Lake** with Parquet storage and date partitioning
+The framework automatically generates and deploys:
+
+- **AppSync GraphQL API** with auto-generated resolvers and API key authentication
+- **Lambda Functions** (5-20+ functions depending on schema complexity) with optimized runtime and memory allocation
+- **DynamoDB Table** with optimized single-table design and DynamoDB Streams enabled
+- **S3 Data Lake** with Parquet storage, date partitioning, and automatic Glue table creation
 - **Athena Tables** with partition projection for ultra-fast queries
-- **IAM Roles** with least-privilege security
+- **IAM Roles** with least-privilege security policies
+- **CloudWatch Logs** for comprehensive monitoring and debugging
 
 ### Function Types Generated
 
-| **Function Type** | **Count**              | **Purpose**               | **Example**                       |
-| ----------------- | ---------------------- | ------------------------- | --------------------------------- |
-| CRUD Operations   | 4 per entity           | Basic database operations | `OCG-api-create-user`             |
-| SQL Queries       | 1 per @sql_query       | Custom analytics          | `OCG-api-query-getTrendingPosts`  |
-| Resolvers         | 1 per @resolver type   | Complex type resolution   | `OCG-api-resolver-postconnection` |
-| Field Resolvers   | 1 per @sql_query field | Individual field queries  | `OCG-api-field-user-totalPosts`   |
-| Stream Processor  | 1 per project          | Real-time data pipeline   | `OCG-api-stream-processor`        |
+| **Function Type** | **Count**              | **Runtime**  | **Memory** | **Timeout** | **Purpose**               | **Example**                       |
+| ----------------- | ---------------------- | ----------- | ---------- | ----------- | ------------------------- | --------------------------------- |
+| CRUD Operations   | 4 per entity           | Node.js 18.x | 128 MB     | 30 seconds  | Basic database operations | `OCG-api-create-user`             |
+| SQL Queries       | 1 per @sql_query       | Node.js 18.x | 256 MB     | 5 minutes   | Custom analytics          | `OCG-api-query-getTrendingPosts`  |
+| Resolvers         | 1 per @resolver type   | Node.js 18.x | 512 MB     | 5 minutes   | Complex type resolution   | `OCG-api-resolver-postconnection` |
+| Field Resolvers   | 1 per @sql_query field | Node.js 18.x | 256 MB     | 5 minutes   | Individual field queries  | `OCG-api-field-user-totalPosts`   |
+| Stream Processor  | 1 per project          | Python 3.11  | 1024 MB    | 5 minutes   | Real-time data pipeline   | `OCG-api-stream-processor`        |
+
+**Function Naming Pattern**: `OCG-{project}-{category}-{identifier}`
+
+All functions are automatically configured with:
+- Environment variables for DynamoDB, S3, Athena, and Glue access
+- IAM roles with least-privilege permissions
+- Connection reuse and retry logic for optimal performance
+- Comprehensive error handling and logging
 
 ### Query Performance Examples
 
@@ -217,10 +228,31 @@ oc-graphql destroy -n my-project --delete-all
 oc-graphql status -n my-project
 ```
 
+## 🏗️ Framework Architecture
+
+OC-GraphQL provides a complete abstraction layer over AWS services:
+
+### Code Generation
+- **Automatic Lambda Functions**: Generates optimized Node.js and Python functions based on your schema
+- **Infrastructure as Code**: Uses AWS CDK to define and deploy all resources
+- **Type-Safe Resolvers**: Auto-generates AppSync resolvers with proper type mapping
+
+### Built-in Patterns
+- **Single-Table DynamoDB**: Optimized key structure for efficient queries
+- **Parquet Data Pipeline**: Real-time stream processing with intelligent type detection
+- **SQL Query Abstraction**: Direct SQL in GraphQL with automatic parameter sanitization
+- **Connection Management**: Optimized AWS SDK usage with connection pooling
+
+### Operational Excellence
+- **Auto-scaling**: All components scale automatically based on demand
+- **Monitoring**: CloudWatch integration for metrics, logs, and alarms
+- **Security**: Built-in IAM policies, SQL injection protection, and encryption
+- **Cost Optimization**: Right-sized resources with 90-98% storage cost reduction
+
 ## 📋 Requirements
 
-- **AWS Account** with appropriate permissions
-- **Node.js** 16+ for CLI tool
+- **AWS Account** with appropriate permissions (IAM, CloudFormation, AppSync, Lambda, DynamoDB, S3, Athena, Glue)
+- **Node.js** 18+ for CLI tool
 - **AWS CLI** configured with credentials
 - **CDK Bootstrap** (automatic on first deployment)
 
