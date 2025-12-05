@@ -18,9 +18,9 @@ export class CodeGenerator {
   async generateAll(): Promise<GeneratedCode> {
     const lambdaFunctions: Record<string, string> = {};
 
-    // Generate CRUD functions for each type
+    // Generate CRUD functions for each type (skip @task_response types)
     for (const type of this.schemaMetadata.types) {
-      if (!type.isPrimitive && !type.isResolver) {
+      if (!type.isPrimitive && !type.isResolver && !type.isTaskResponse) {
         lambdaFunctions[
           `ocg-${this.projectName}-create-${type.name.toLowerCase()}.js`
         ] = this.generateCreateFunction(type);
@@ -77,6 +77,25 @@ export class CodeGenerator {
     // Generate DynamoDB stream processor (Python with Parquet support)
     lambdaFunctions[`ocg-${this.projectName}-stream-processor.py`] =
       this.generateStreamProcessor();
+
+    // Generate task functions for queries with @task directive
+    for (const query of this.schemaMetadata.queries) {
+      if (query.isTask && query.sqlQuery) {
+        // Generate triggerTask mutation
+        lambdaFunctions[
+          `ocg-${this.projectName}-mutation-triggerTask${this.capitalizeFirst(query.name)}.js`
+        ] = this.generateTriggerTaskMutation(query);
+
+        // Generate taskResult query
+        lambdaFunctions[
+          `ocg-${this.projectName}-query-taskResult${this.capitalizeFirst(query.name)}.js`
+        ] = this.generateTaskResultQuery(query);
+      }
+    }
+
+    // Generate EventBridge Lambda for tracking Athena query executions
+    lambdaFunctions[`ocg-${this.projectName}-athena-execution-tracker.js`] =
+      this.generateAthenaExecutionTracker();
 
     // Generate processed schema (without custom directives)
     const processedSchema = this.generateProcessedSchema();
@@ -481,13 +500,80 @@ exports.handler = async (event) => {
     const queryPromises = [
 ${fieldsWithQueries
   .map((field) => {
-    const resultProcessing = field.isList
-      ? "result"
-      : "result[0] && result[0]['_col0'] ? result[0]['_col0'] : result[0] || null";
-    return `
+    // For list fields, return the entire result array
+    // For scalar fields, extract the value from the first row
+    // If the result has a field matching the field name, use that
+    // Otherwise, try _col0 or the first value in the object
+    const fieldType = this.schemaMetadata.types.find(
+      (t) => t.name === field.type
+    );
+    const isScalar = fieldType?.isPrimitive || false;
+
+    if (field.isList) {
+      return `
       executeQuery(\`${field.sqlQuery!.query}\`, { ...sourceArgs, ...fieldArgs })
-        .then(result => ({ field: '${field.name}', result: ${resultProcessing} }))
+        .then(result => ({ field: '${field.name}', result: result }))
 `;
+    } else {
+      // For scalar fields, extract the value from the first row
+      // Try field name first, then _col0, then first value in object
+      return `
+      executeQuery(\`${field.sqlQuery!.query}\`, { ...sourceArgs, ...fieldArgs })
+        .then(result => {
+          if (!result || result.length === 0) return { field: '${field.name}', result: null };
+          const firstRow = result[0];
+          let value = null;
+          
+          // Try to get value by field name (e.g., result[0].total for "total" field)
+          if (firstRow['${field.name}'] !== undefined) {
+            value = firstRow['${field.name}'];
+          } else if (firstRow['_col0'] !== undefined) {
+            // Fallback to _col0 (for queries like SELECT COUNT(*) without alias)
+            value = firstRow['_col0'];
+          } else {
+            // Fallback to first value in the object
+            const keys = Object.keys(firstRow);
+            if (keys.length > 0) {
+              value = firstRow[keys[0]];
+            }
+          }
+          
+          // Convert to appropriate type
+          ${
+            field.type === "Int"
+              ? `
+          if (value !== null && value !== undefined) {
+            const num = typeof value === 'string' ? parseInt(value, 10) : Number(value);
+            value = isNaN(num) ? null : num;
+          }`
+              : ""
+          }
+          ${
+            field.type === "Float"
+              ? `
+          if (value !== null && value !== undefined) {
+            const num = typeof value === 'string' ? parseFloat(value) : Number(value);
+            value = isNaN(num) ? null : num;
+          }`
+              : ""
+          }
+          ${
+            field.type === "Boolean"
+              ? `
+          if (value !== null && value !== undefined) {
+            if (typeof value === 'string') {
+              value = value.toLowerCase() === 'true' || value === '1';
+            } else {
+              value = Boolean(value);
+            }
+          }`
+              : ""
+          }
+          
+          return { field: '${field.name}', result: value };
+        })
+`;
+    }
   })
   .join(",\n")}
     ];
@@ -1301,21 +1387,73 @@ def format_date_parts(date_obj):
       })
       .join("\n");
 
+    // Generate task mutations (triggerTask) for queries with @task directive
+    const taskMutations = this.schemaMetadata.queries
+      .filter((q) => q.isTask && q.sqlQuery)
+      .map((q) => {
+        const args = q.arguments
+          ? q.arguments
+              .map((arg) => {
+                const argType = arg.isList ? `[${arg.type}!]` : arg.type;
+                const required = arg.isRequired ? "!" : "";
+                return `${arg.name}: ${argType}${required}`;
+              })
+              .join(", ")
+          : "";
+        const argsString = args ? `(${args})` : "";
+        return `  triggerTask${this.capitalizeFirst(q.name)}${argsString}: TaskTriggerResult!`;
+      })
+      .join("\n");
+
+    // Generate task result queries (taskResult) for queries with @task directive
+    const taskResultQueries = this.schemaMetadata.queries
+      .filter((q) => q.isTask && q.sqlQuery)
+      .map((q) => {
+        const returnType = q.isList ? `[${q.type}!]` : q.type;
+        return `  taskResult${this.capitalizeFirst(q.name)}(taskId: ID!): TaskResult${this.capitalizeFirst(q.name)}!`;
+      })
+      .join("\n");
+
     return `
 type Query {
 ${crudQueries}
 ${customQueries}
+${taskResultQueries}
 }
 
 type Mutation {
 ${crudMutations}
 ${customMutations}
+${taskMutations}
 }
 
 type DeleteResult {
   id: ID!
   deleted: Boolean!
 }
+
+type TaskTriggerResult {
+  taskId: ID!
+}
+
+enum TaskStatus {
+  RUNNING
+  SUCCEEDED
+  FAILED
+}
+${this.schemaMetadata.queries
+  .filter((q) => q.isTask && q.sqlQuery)
+  .map((q) => {
+    const returnType = q.isList ? `[${q.type}!]` : q.type;
+    return `
+type TaskResult${this.capitalizeFirst(q.name)} {
+  taskStatus: TaskStatus!
+  result: ${returnType}
+  startDate: AWSDateTime!
+  finishDate: AWSDateTime
+}`;
+  })
+  .join("\n")}
 `;
   }
 
@@ -1334,5 +1472,376 @@ type DeleteResult {
 
     const tsType = typeMap[graphqlType] || graphqlType;
     return isList ? `${tsType}[]` : tsType;
+  }
+
+  private capitalizeFirst(str: string): string {
+    return str.charAt(0).toUpperCase() + str.slice(1);
+  }
+
+  private countSqlQueriesInQuery(query: FieldMetadata): number {
+    // For simple queries with @sql_query, count is 1
+    if (query.sqlQuery) {
+      return 1;
+    }
+
+    // If query returns a resolver type, count SQL queries in that type
+    const resolverType = this.schemaMetadata.types.find(
+      (t) => t.name === query.type && t.isResolver
+    );
+
+    if (resolverType) {
+      // Count all fields with @sql_query in the resolver type
+      return resolverType.fields.filter((f) => f.sqlQuery).length;
+    }
+
+    return 0;
+  }
+
+  private generateTriggerTaskMutation(query: FieldMetadata): string {
+    const queryName = query.name;
+    const capitalizedQueryName = this.capitalizeFirst(queryName);
+
+    // Build arguments string
+    const argsString = query.arguments
+      ? query.arguments
+          .map((arg) => {
+            const argType = arg.isList ? `[${arg.type}!]` : arg.type;
+            const required = arg.isRequired ? "!" : "";
+            return `${arg.name}: ${argType}${required}`;
+          })
+          .join(", ")
+      : "";
+
+    return `
+const { DynamoDBClient, PutItemCommand } = require('@aws-sdk/client-dynamodb');
+const { AthenaClient, StartQueryExecutionCommand } = require('@aws-sdk/client-athena');
+const { marshall } = require('@aws-sdk/util-dynamodb');
+
+const dynamoClient = new DynamoDBClient({ region: process.env.AWS_REGION });
+const athenaClient = new AthenaClient({ region: process.env.AWS_REGION });
+const TABLE_NAME = process.env.DYNAMODB_TABLE_NAME;
+const DATABASE_NAME = process.env.ATHENA_DATABASE_NAME;
+const S3_OUTPUT_LOCATION = process.env.ATHENA_OUTPUT_LOCATION;
+
+// SQL injection prevention function
+function escapeSqlValue(value) {
+  if (value === null || value === undefined) {
+    return 'NULL';
+  } else if (typeof value === 'number') {
+    if (!isFinite(value)) {
+      throw new Error('Invalid number value');
+    }
+    return value.toString();
+  } else if (typeof value === 'boolean') {
+    return value ? 'true' : 'false';
+  } else if (typeof value === 'string') {
+    let escaped = value.split("'").join("''");
+    return "'" + escaped + "'";
+  } else {
+    throw new Error('Unsupported data type for SQL parameter');
+  }
+}
+
+exports.handler = async (event) => {
+  try {
+    const now = new Date().toISOString();
+    
+    // Prepare SQL query with parameter replacement
+    let sqlQuery = \`${query.sqlQuery!.query}\`;
+    
+    // Replace parameter placeholders
+    if (event.arguments) {
+      Object.entries(event.arguments).forEach(([key, value]) => {
+        const argsPattern = '$args.' + key;
+        const sqlSafeValue = escapeSqlValue(value);
+        sqlQuery = sqlQuery.split(argsPattern).join(sqlSafeValue);
+      });
+    }
+    
+    // Replace virtual table references
+    sqlQuery = sqlQuery.replace(/\\$virtual_table\\(([^)]+)\\)/g, '$1');
+    
+    // Start Athena query execution
+    const queryExecution = await athenaClient.send(new StartQueryExecutionCommand({
+      QueryString: sqlQuery,
+      QueryExecutionContext: {
+        Database: DATABASE_NAME
+      },
+      ResultConfiguration: {
+        OutputLocation: S3_OUTPUT_LOCATION
+      }
+    }));
+    
+    // Use execution ID as task ID (only one query per task)
+    const taskId = queryExecution.QueryExecutionId;
+    
+    // Create task entity
+    const taskItem = {
+      PK: \`task#\${taskId}\`,
+      SK: \`task#\${taskId}\`,
+      id: taskId,
+      entityType: 'task',
+      entityId: taskId,
+      taskStatus: 'RUNNING',
+      startDate: now,
+      finishDate: null,
+      createdAt: now,
+      updatedAt: now
+    };
+    
+    await dynamoClient.send(new PutItemCommand({
+      TableName: TABLE_NAME,
+      Item: marshall(taskItem)
+    }));
+    
+    return { taskId };
+  } catch (error) {
+    console.error('Error triggering task:', error);
+    throw error;
+  }
+};
+`;
+  }
+
+  private generateTaskResultQuery(query: FieldMetadata): string {
+    const queryName = query.name;
+    const capitalizedQueryName = this.capitalizeFirst(queryName);
+    const returnType = query.isList ? `[${query.type}!]` : query.type;
+
+    return `
+const { DynamoDBClient, GetItemCommand, UpdateItemCommand } = require('@aws-sdk/client-dynamodb');
+const { AthenaClient, GetQueryExecutionCommand, GetQueryResultsCommand } = require('@aws-sdk/client-athena');
+const { unmarshall } = require('@aws-sdk/util-dynamodb');
+
+const dynamoClient = new DynamoDBClient({ region: process.env.AWS_REGION });
+const athenaClient = new AthenaClient({ region: process.env.AWS_REGION });
+const TABLE_NAME = process.env.DYNAMODB_TABLE_NAME;
+
+exports.handler = async (event) => {
+  try {
+    const taskId = event.arguments.taskId;
+    
+    // Get task entity (taskId is the execution ID)
+    const taskResult = await dynamoClient.send(new GetItemCommand({
+      TableName: TABLE_NAME,
+      Key: {
+        PK: { S: \`task#\${taskId}\` },
+        SK: { S: \`task#\${taskId}\` }
+      }
+    }));
+    
+    if (!taskResult.Item) {
+      throw new Error('Task not found');
+    }
+    
+    let task = unmarshall(taskResult.Item);
+    let taskStatus = task.taskStatus || 'RUNNING';
+    let finishDate = task.finishDate || null;
+    
+    // Poll Athena directly for execution status if still RUNNING
+    if (taskStatus === 'RUNNING' || taskStatus === 'QUEUED') {
+      try {
+        const execResult = await athenaClient.send(new GetQueryExecutionCommand({
+          QueryExecutionId: taskId
+        }));
+        
+        const status = execResult.QueryExecution?.Status?.State || 'UNKNOWN';
+        const statusChangeDateTime = execResult.QueryExecution?.Status?.StateChangeDateTime;
+        
+        // Map Athena status to task status
+        if (status === 'SUCCEEDED') {
+          taskStatus = 'SUCCEEDED';
+        } else if (status === 'FAILED' || status === 'CANCELLED') {
+          taskStatus = 'FAILED';
+        } else {
+          taskStatus = 'RUNNING';
+        }
+        
+        // Update task entity if status changed
+        if (task.taskStatus !== taskStatus) {
+          const updateExpression = taskStatus === 'SUCCEEDED' || taskStatus === 'FAILED'
+            ? 'SET taskStatus = :status, finishDate = :finishDate, updatedAt = :updatedAt'
+            : 'SET taskStatus = :status, updatedAt = :updatedAt';
+          
+          const expressionAttributeValues = taskStatus === 'SUCCEEDED' || taskStatus === 'FAILED'
+            ? {
+                ':status': { S: taskStatus },
+                ':finishDate': { S: statusChangeDateTime || new Date().toISOString() },
+                ':updatedAt': { S: new Date().toISOString() }
+              }
+            : {
+                ':status': { S: taskStatus },
+                ':updatedAt': { S: new Date().toISOString() }
+              };
+          
+          await dynamoClient.send(new UpdateItemCommand({
+            TableName: TABLE_NAME,
+            Key: {
+              PK: { S: \`task#\${taskId}\` },
+              SK: { S: \`task#\${taskId}\` }
+            },
+            UpdateExpression: updateExpression,
+            ExpressionAttributeValues: expressionAttributeValues
+          }));
+          
+          // Refresh task to get updated finishDate
+          const updatedTaskResult = await dynamoClient.send(new GetItemCommand({
+            TableName: TABLE_NAME,
+            Key: {
+              PK: { S: \`task#\${taskId}\` },
+              SK: { S: \`task#\${taskId}\` }
+            }
+          }));
+          if (updatedTaskResult.Item) {
+            task = unmarshall(updatedTaskResult.Item);
+            finishDate = task.finishDate || null;
+          }
+        }
+      } catch (error) {
+        console.error(\`Error polling Athena for execution \${taskId}:\`, error);
+      }
+    }
+    
+    // Build result if query completed successfully
+    let result = null;
+    if (taskStatus === 'SUCCEEDED') {
+      try {
+        const athenaResults = await athenaClient.send(new GetQueryResultsCommand({
+          QueryExecutionId: taskId,
+          MaxResults: 1000
+        }));
+        
+        const rows = athenaResults.ResultSet?.Rows || [];
+        const headers = rows[0]?.Data?.map(col => col.VarCharValue) || [];
+        const data = rows.slice(1).map(row => {
+          const obj = {};
+          row.Data?.forEach((col, index) => {
+            obj[headers[index]] = col.VarCharValue;
+          });
+          return obj;
+        });
+        
+        result = ${query.isList ? "data" : "data[0] || null"};
+      } catch (error) {
+        console.error(\`Error retrieving results for execution \${taskId}:\`, error);
+        result = null;
+      }
+    }
+    
+    return {
+      taskStatus,
+      result,
+      startDate: task.startDate,
+      finishDate: finishDate
+    };
+  } catch (error) {
+    console.error('Error getting task result:', error);
+    throw error;
+  }
+};
+`;
+  }
+
+  private generateAthenaExecutionTracker(): string {
+    return `
+const { DynamoDBClient, GetItemCommand, UpdateItemCommand } = require('@aws-sdk/client-dynamodb');
+const { AthenaClient, GetQueryExecutionCommand } = require('@aws-sdk/client-athena');
+const { unmarshall } = require('@aws-sdk/util-dynamodb');
+
+const dynamoClient = new DynamoDBClient({ region: process.env.AWS_REGION });
+const athenaClient = new AthenaClient({ region: process.env.AWS_REGION });
+const TABLE_NAME = process.env.DYNAMODB_TABLE_NAME;
+
+exports.handler = async (event) => {
+  try {
+    // EventBridge event structure for Athena Query State Change events
+    // Example event structure:
+    // {
+    //   "detail-type": "Athena Query State Change",
+    //   "source": "aws.athena",
+    //   "detail": {
+    //     "queryExecutionId": "01234567-0123-0123-0123-012345678901",
+    //     "currentState": "SUCCEEDED",
+    //     "previousState": "RUNNING",
+    //     "athenaError": { ... } // Only present when FAILED
+    //   }
+    // }
+    const executionId = event.detail?.queryExecutionId;
+    const status = event.detail?.currentState;
+    
+    if (!executionId || !status) {
+      console.log('Missing executionId or status in event:', JSON.stringify(event, null, 2));
+      return { statusCode: 400, body: 'Missing required fields' };
+    }
+    
+    // Only process terminal states (SUCCEEDED, FAILED, CANCELLED)
+    if (!['SUCCEEDED', 'FAILED', 'CANCELLED'].includes(status)) {
+      console.log(\`Skipping non-terminal state: \${status} for execution \${executionId}\`);
+      return { statusCode: 200, body: 'Skipped - non-terminal state' };
+    }
+    
+    console.log(\`Processing Athena execution \${executionId} with status \${status}\`);
+    
+    // Check if task exists (executionId is the taskId)
+    const taskResult = await dynamoClient.send(new GetItemCommand({
+      TableName: TABLE_NAME,
+      Key: {
+        PK: { S: \`task#\${executionId}\` },
+        SK: { S: \`task#\${executionId}\` }
+      }
+    }));
+    
+    if (!taskResult.Item) {
+      console.log(\`Task entity not found for execution \${executionId} (may not be a task query)\`);
+      return { statusCode: 404, body: 'Task not found' };
+    }
+    
+    // Map Athena status to task status
+    let taskStatus = 'RUNNING';
+    if (status === 'SUCCEEDED') {
+      taskStatus = 'SUCCEEDED';
+    } else if (status === 'FAILED' || status === 'CANCELLED') {
+      taskStatus = 'FAILED';
+    }
+    
+    // Get execution details to get finish date
+    let finishDate = null;
+    try {
+      const execResult = await athenaClient.send(new GetQueryExecutionCommand({
+        QueryExecutionId: executionId
+      }));
+      finishDate = execResult.QueryExecution?.Status?.StateChangeDateTime || new Date().toISOString();
+    } catch (error) {
+      console.error(\`Error getting execution details for \${executionId}:\`, error);
+      finishDate = new Date().toISOString();
+    }
+    
+    // Update task entity
+    const updateExpression = 'SET taskStatus = :status, finishDate = :finishDate, updatedAt = :updatedAt';
+    const expressionAttributeValues = {
+      ':status': { S: taskStatus },
+      ':finishDate': { S: finishDate },
+      ':updatedAt': { S: new Date().toISOString() }
+    };
+    
+    await dynamoClient.send(new UpdateItemCommand({
+      TableName: TABLE_NAME,
+      Key: {
+        PK: { S: \`task#\${executionId}\` },
+        SK: { S: \`task#\${executionId}\` }
+      },
+      UpdateExpression: updateExpression,
+      ExpressionAttributeValues: expressionAttributeValues
+    }));
+    
+    console.log(\`Successfully updated task \${executionId} with status \${taskStatus}\`);
+    
+    return { statusCode: 200, body: 'Success' };
+  } catch (error) {
+    console.error('Error tracking Athena execution:', error);
+    throw error;
+  }
+};
+`;
   }
 }

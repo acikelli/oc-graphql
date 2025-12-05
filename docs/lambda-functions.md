@@ -9,9 +9,12 @@ OC-GraphQL automatically generates a comprehensive set of Lambda functions to ha
 1. **CRUD Functions** - Basic entity operations (Create, Read, Update, Delete)
 2. **Query Functions** - Custom SQL query execution
 3. **Mutation Functions** - Custom SQL mutations
-4. **Resolver Functions** - Complex type resolution with multiple SQL queries
-5. **Field Resolver Functions** - Individual field-level SQL queries
-6. **Stream Processor** - DynamoDB to Parquet data pipeline
+4. **Task Trigger Mutations** - Start asynchronous long-running queries
+5. **Task Result Queries** - Poll task status and retrieve results
+6. **Execution Tracker** - EventBridge Lambda for tracking Athena query executions
+7. **Resolver Functions** - Complex type resolution with multiple SQL queries
+8. **Field Resolver Functions** - Individual field-level SQL queries
+9. **Stream Processor** - DynamoDB to Parquet data pipeline
 
 ## 📋 Function Naming Patterns
 
@@ -22,6 +25,9 @@ Pattern: OCG-{project}-{category}-{identifier}
 Examples:
 - OCG-blog-create-user
 - OCG-blog-query-getPopularPosts
+- OCG-blog-mutation-triggerTaskGenerateReport
+- OCG-blog-query-taskResultGenerateReport
+- OCG-blog-athena-execution-tracker
 - OCG-blog-resolver-postconnection
 - OCG-blog-stream-processor
 ```
@@ -230,7 +236,384 @@ exports.handler = async (event) => {
 };
 ```
 
-### 3. Resolver Functions (Node.js 18.x)
+### 3. Task Trigger Mutations (Node.js 18.x)
+
+Auto-generated for queries with `@task` directive to handle long-running Athena queries asynchronously.
+
+**Requirements:**
+
+- `@task` can only be used on `Query` fields (not `Mutation`)
+- The return type must have the `@task_response` directive
+- Types with `@task_response` do not generate CRUD operations
+
+```javascript
+// Pattern: OCG-{project}-mutation-triggerTask{QueryName}
+// Example: OCG-blog-mutation-triggerTaskGenerateYearlyReport
+
+const { DynamoDBClient, PutItemCommand } = require("@aws-sdk/client-dynamodb");
+const {
+  AthenaClient,
+  StartQueryExecutionCommand,
+} = require("@aws-sdk/client-athena");
+const { marshall } = require("@aws-sdk/util-dynamodb");
+
+exports.handler = async (event) => {
+  const now = new Date().toISOString();
+
+  // Prepare SQL query with parameter replacement
+  let sqlQuery = `SELECT month, COUNT(*) as orders FROM orders WHERE year = $args.year GROUP BY month`;
+
+  // Replace parameters
+  if (event.arguments) {
+    Object.entries(event.arguments).forEach(([key, value]) => {
+      const argsPattern = "$args." + key;
+      const sqlSafeValue = escapeSqlValue(value);
+      sqlQuery = sqlQuery.split(argsPattern).join(sqlSafeValue);
+    });
+  }
+
+  // Start Athena query execution
+  const queryExecution = await athenaClient.send(
+    new StartQueryExecutionCommand({
+      QueryString: sqlQuery,
+      QueryExecutionContext: { Database: DATABASE_NAME },
+      ResultConfiguration: { OutputLocation: S3_OUTPUT_LOCATION },
+    })
+  );
+
+  // Use execution ID as task ID (one query per task)
+  const taskId = queryExecution.QueryExecutionId;
+
+  // Create task entity
+  const taskItem = {
+    PK: `task#${taskId}`,
+    SK: `task#${taskId}`,
+    id: taskId,
+    entityType: "task",
+    entityId: taskId,
+    taskStatus: "RUNNING",
+    startDate: now,
+    finishDate: null,
+    createdAt: now,
+    updatedAt: now,
+  };
+
+  await dynamoClient.send(
+    new PutItemCommand({
+      TableName: TABLE_NAME,
+      Item: marshall(taskItem),
+    })
+  );
+
+  return { taskId }; // taskId is the Athena execution ID
+};
+```
+
+**Key Features:**
+
+- Uses Athena execution ID as task ID (simplified - one query per task)
+- Creates task entity with status tracking
+- Returns immediately with taskId (non-blocking)
+- No separate execution entity needed
+
+### 4. Task Result Queries (Node.js 18.x)
+
+Poll task status and retrieve results for completed tasks.
+
+```javascript
+// Pattern: OCG-{project}-query-taskResult{QueryName}
+// Example: OCG-blog-query-taskResultGenerateYearlyReport
+
+const {
+  DynamoDBClient,
+  GetItemCommand,
+  UpdateItemCommand,
+} = require("@aws-sdk/client-dynamodb");
+const {
+  AthenaClient,
+  GetQueryExecutionCommand,
+  GetQueryResultsCommand,
+} = require("@aws-sdk/client-athena");
+const { unmarshall } = require("@aws-sdk/util-dynamodb");
+
+exports.handler = async (event) => {
+  const taskId = event.arguments.taskId; // taskId is the Athena execution ID
+
+  // Get task entity
+  const taskResult = await dynamoClient.send(
+    new GetItemCommand({
+      TableName: TABLE_NAME,
+      Key: {
+        PK: { S: `task#${taskId}` },
+        SK: { S: `task#${taskId}` },
+      },
+    })
+  );
+
+  if (!taskResult.Item) {
+    throw new Error("Task not found");
+  }
+
+  let task = unmarshall(taskResult.Item);
+  let taskStatus = task.taskStatus || "RUNNING";
+  let finishDate = task.finishDate || null;
+
+  // Poll Athena directly for execution status if still RUNNING
+  if (taskStatus === "RUNNING" || taskStatus === "QUEUED") {
+    try {
+      const execResult = await athenaClient.send(
+        new GetQueryExecutionCommand({
+          QueryExecutionId: taskId,
+        })
+      );
+
+      const status = execResult.QueryExecution?.Status?.State || "UNKNOWN";
+      const statusChangeDateTime =
+        execResult.QueryExecution?.Status?.StateChangeDateTime;
+
+      // Map Athena status to task status
+      if (status === "SUCCEEDED") {
+        taskStatus = "SUCCEEDED";
+      } else if (status === "FAILED" || status === "CANCELLED") {
+        taskStatus = "FAILED";
+      } else {
+        taskStatus = "RUNNING";
+      }
+
+      // Update task entity if status changed
+      if (task.taskStatus !== taskStatus) {
+        const updateExpression =
+          taskStatus === "SUCCEEDED" || taskStatus === "FAILED"
+            ? "SET taskStatus = :status, finishDate = :finishDate, updatedAt = :updatedAt"
+            : "SET taskStatus = :status, updatedAt = :updatedAt";
+
+        const expressionAttributeValues =
+          taskStatus === "SUCCEEDED" || taskStatus === "FAILED"
+            ? {
+                ":status": { S: taskStatus },
+                ":finishDate": {
+                  S: statusChangeDateTime || new Date().toISOString(),
+                },
+                ":updatedAt": { S: new Date().toISOString() },
+              }
+            : {
+                ":status": { S: taskStatus },
+                ":updatedAt": { S: new Date().toISOString() },
+              };
+
+        await dynamoClient.send(
+          new UpdateItemCommand({
+            TableName: TABLE_NAME,
+            Key: {
+              PK: { S: `task#${taskId}` },
+              SK: { S: `task#${taskId}` },
+            },
+            UpdateExpression: updateExpression,
+            ExpressionAttributeValues: expressionAttributeValues,
+          })
+        );
+
+        // Refresh task to get updated finishDate
+        const updatedTaskResult = await dynamoClient.send(
+          new GetItemCommand({
+            TableName: TABLE_NAME,
+            Key: {
+              PK: { S: `task#${taskId}` },
+              SK: { S: `task#${taskId}` },
+            },
+          })
+        );
+        if (updatedTaskResult.Item) {
+          task = unmarshall(updatedTaskResult.Item);
+          finishDate = task.finishDate || null;
+        }
+      }
+    } catch (error) {
+      console.error(`Error polling Athena for execution ${taskId}:`, error);
+    }
+  }
+
+  // Build result if query completed successfully
+  let result = null;
+  if (taskStatus === "SUCCEEDED") {
+    try {
+      const athenaResults = await athenaClient.send(
+        new GetQueryResultsCommand({
+          QueryExecutionId: taskId,
+          MaxResults: 1000,
+        })
+      );
+
+      const rows = athenaResults.ResultSet?.Rows || [];
+      const headers = rows[0]?.Data?.map((col) => col.VarCharValue) || [];
+      const data = rows.slice(1).map((row) => {
+        const obj = {};
+        row.Data?.forEach((col, index) => {
+          obj[headers[index]] = col.VarCharValue;
+        });
+        return obj;
+      });
+
+      result = data; // or data[0] for single result
+    } catch (error) {
+      console.error(`Error retrieving results for execution ${taskId}:`, error);
+      result = null;
+    }
+  }
+
+  return {
+    taskStatus,
+    result, // Null if still running or failed
+    startDate: task.startDate,
+    finishDate: finishDate, // Null if still running
+  };
+};
+```
+
+**Key Features:**
+
+- **Hybrid Polling**: Checks DynamoDB first, then polls Athena directly if task is still RUNNING/QUEUED
+- **Automatic Updates**: Updates task entity in DynamoDB with latest status and finish date during polling
+- **Result Retrieval**: Retrieves results directly from Athena when task succeeds
+- **Reliable**: Works even without EventBridge - polling ensures tasks never get stuck
+- **Simplified Response**: Only returns `taskStatus`, `result`, `startDate`, and `finishDate`
+- Returns null result if task is still RUNNING or FAILED
+
+### 5. Execution Tracker (Node.js 18.x)
+
+EventBridge Lambda that automatically tracks Athena query execution state changes and updates task status.
+
+```javascript
+// Pattern: OCG-{project}-athena-execution-tracker
+// Example: OCG-blog-athena-execution-tracker
+
+const {
+  DynamoDBClient,
+  GetItemCommand,
+  UpdateItemCommand,
+} = require("@aws-sdk/client-dynamodb");
+const {
+  AthenaClient,
+  GetQueryExecutionCommand,
+} = require("@aws-sdk/client-athena");
+const { unmarshall } = require("@aws-sdk/util-dynamodb");
+
+exports.handler = async (event) => {
+  // EventBridge event structure for Athena Query State Change events
+  // {
+  //   "detail-type": "Athena Query State Change",
+  //   "source": "aws.athena",
+  //   "detail": {
+  //     "queryExecutionId": "01234567-0123-0123-0123-012345678901",
+  //     "currentState": "SUCCEEDED",
+  //     "previousState": "RUNNING",
+  //     "athenaError": { ... } // Only present when FAILED
+  //   }
+  // }
+  const executionId = event.detail?.queryExecutionId;
+  const status = event.detail?.currentState;
+
+  if (!executionId || !status) {
+    console.log(
+      "Missing executionId or status in event:",
+      JSON.stringify(event, null, 2)
+    );
+    return { statusCode: 400, body: "Missing required fields" };
+  }
+
+  // Only process terminal states (SUCCEEDED, FAILED, CANCELLED)
+  if (!["SUCCEEDED", "FAILED", "CANCELLED"].includes(status)) {
+    console.log(
+      `Skipping non-terminal state: ${status} for execution ${executionId}`
+    );
+    return { statusCode: 200, body: "Skipped - non-terminal state" };
+  }
+
+  console.log(
+    `Processing Athena execution ${executionId} with status ${status}`
+  );
+
+  // Check if task exists (executionId is the taskId)
+  const taskResult = await dynamoClient.send(
+    new GetItemCommand({
+      TableName: TABLE_NAME,
+      Key: {
+        PK: { S: `task#${executionId}` },
+        SK: { S: `task#${executionId}` },
+      },
+    })
+  );
+
+  if (!taskResult.Item) {
+    console.log(
+      `Task entity not found for execution ${executionId} (may not be a task query)`
+    );
+    return { statusCode: 404, body: "Task not found" };
+  }
+
+  // Map Athena status to task status
+  let taskStatus = "RUNNING";
+  if (status === "SUCCEEDED") {
+    taskStatus = "SUCCEEDED";
+  } else if (status === "FAILED" || status === "CANCELLED") {
+    taskStatus = "FAILED";
+  }
+
+  // Get execution details to get finish date
+  let finishDate = null;
+  try {
+    const execResult = await athenaClient.send(
+      new GetQueryExecutionCommand({
+        QueryExecutionId: executionId,
+      })
+    );
+    finishDate =
+      execResult.QueryExecution?.Status?.StateChangeDateTime ||
+      new Date().toISOString();
+  } catch (error) {
+    console.error(`Error getting execution details for ${executionId}:`, error);
+    finishDate = new Date().toISOString();
+  }
+
+  // Update task entity
+  const updateExpression =
+    "SET taskStatus = :status, finishDate = :finishDate, updatedAt = :updatedAt";
+  const expressionAttributeValues = {
+    ":status": { S: taskStatus },
+    ":finishDate": { S: finishDate },
+    ":updatedAt": { S: new Date().toISOString() },
+  };
+
+  await dynamoClient.send(
+    new UpdateItemCommand({
+      TableName: TABLE_NAME,
+      Key: {
+        PK: { S: `task#${executionId}` },
+        SK: { S: `task#${executionId}` },
+      },
+      UpdateExpression: updateExpression,
+      ExpressionAttributeValues: expressionAttributeValues,
+    })
+  );
+
+  console.log(
+    `Successfully updated task ${executionId} with status ${taskStatus}`
+  );
+
+  return { statusCode: 200, body: "Success" };
+};
+```
+
+**Key Features:**
+
+- Listens for native Athena Query State Change events via EventBridge
+- Updates task entity with status and finish date
+- Uses execution ID as task ID (simplified structure)
+- No separate execution entity needed
+- Handles both EventBridge and CloudTrail event structures
+- **Note**: The `taskResult` query also polls Athena directly as a fallback, so tasks work even without EventBridge
+
+### 6. Resolver Functions (Node.js 18.x)
 
 Handle complex types with multiple SQL queries executed in parallel.
 
@@ -281,7 +664,7 @@ exports.handler = async (event) => {
 };
 ```
 
-### 4. Field Resolver Functions (Node.js 18.x)
+### 7. Field Resolver Functions (Node.js 18.x)
 
 Execute SQL queries for individual fields within regular entity types.
 
@@ -307,7 +690,7 @@ exports.handler = async (event) => {
 };
 ```
 
-### 5. Stream Processor (Python 3.11)
+### 8. Stream Processor (Python 3.11)
 
 Real-time DynamoDB to Parquet conversion with advanced optimization, virtual table support, and automatic Glue table management.
 
@@ -344,7 +727,7 @@ def lambda_handler(event, context):
         except Exception as e:
             logger.error(f"Error processing record: {str(e)}")
             # Continue processing other records
-    
+
     return {'statusCode': 200, 'body': 'Stream processing completed'}
 
 def process_record(record):
@@ -352,17 +735,17 @@ def process_record(record):
     try:
         event_name = record['eventName']  # INSERT, MODIFY, REMOVE
         logger.info(f"Processing DynamoDB event: {event_name}")
-        
+
         current_date = datetime.utcnow()
         year = current_date.strftime('%Y')
         month = current_date.strftime('%m')
         day = current_date.strftime('%d')
-        
+
         if event_name == 'REMOVE':
             handle_delete_operation(record, current_date, year, month, day)
         else:
             handle_insert_update_operation(record, event_name, current_date, year, month, day)
-            
+
     except Exception as e:
         logger.error(f"Error processing stream record: {str(e)}")
 
@@ -370,13 +753,13 @@ def handle_delete_operation(record, current_date, year, month, day):
     """Handle DELETE operations by removing Parquet files from S3"""
     if 'OldImage' not in record.get('dynamodb', {}):
         return
-    
+
     item = unmarshall_dynamodb_item(record['dynamodb']['OldImage'])
     entity_type = item.get('entityType')
-    
+
     if not entity_type:
         return
-    
+
     # Determine S3 key for deletion with date partitioning
     if item.get('virtualTable'):
         # Virtual table: use composite key from PK/SK
@@ -385,21 +768,21 @@ def handle_delete_operation(record, current_date, year, month, day):
         sk_parts = item['SK'].split('#')
         key_components = pk_parts[2:] + sk_parts[2:]
         key_string = '_'.join(key_components)
-        
+
         # Use original creation date for deletion
         item_date = parse_item_date(item.get('createdAt'), current_date)
         item_year, item_month, item_day = format_date_parts(item_date)
-        
+
         s3_key = f"tables/{virtual_table}/year={item_year}/month={item_month}/day={item_day}/{key_string}.parquet"
     else:
         # Regular entity: use ID
         item_date = parse_item_date(item.get('createdAt'), current_date)
         item_year, item_month, item_day = format_date_parts(item_date)
-        
+
         s3_key = f"tables/{entity_type}/year={item_year}/month={item_month}/day={item_day}/{item['id']}.parquet"
-    
+
     logger.info(f"Deleting S3 object: {s3_key}")
-    
+
     try:
         s3_client.delete_object(Bucket=BUCKET_NAME, Key=s3_key)
         logger.info(f"Successfully deleted S3 object: {s3_key}")
@@ -411,20 +794,20 @@ def handle_insert_update_operation(record, event_name, current_date, year, month
     image_data = record.get('dynamodb', {}).get('NewImage')
     if not image_data:
         return
-    
+
     item = unmarshall_dynamodb_item(image_data)
     entity_type = item.get('entityType')
-    
+
     if not entity_type:
         return
-    
+
     # Add processing metadata
     item['_processing_timestamp'] = current_date.isoformat()
     item['_event_name'] = event_name
     item['_partition_year'] = year
     item['_partition_month'] = month
     item['_partition_day'] = day
-    
+
     if item.get('virtualTable'):
         handle_virtual_table_item(item, year, month, day, event_name)
     else:
@@ -435,20 +818,20 @@ def handle_virtual_table_item(item, year, month, day, event_name):
     virtual_table = item['virtualTable']
     pk_parts = item['PK'].split('#')
     sk_parts = item['SK'].split('#')
-    
+
     key_components = pk_parts[2:] + sk_parts[2:]
     key_string = '_'.join(key_components)
-    
+
     s3_key = f"tables/{virtual_table}/year={year}/month={month}/day={day}/{key_string}.parquet"
     table_location = f"s3://{BUCKET_NAME}/tables/{virtual_table}/"
     athena_table_name = virtual_table
-    
+
     logger.info(f"Processing virtual table item for '{virtual_table}' - {event_name}")
-    
+
     # Convert to DataFrame and write as Parquet
     df = create_dataframe_from_item(item)
     write_parquet_to_s3(df, s3_key)
-    
+
     # Ensure Glue table exists with Parquet format
     ensure_optimized_glue_table(athena_table_name, table_location, item, df)
 
@@ -457,25 +840,25 @@ def handle_regular_entity_item(item, entity_type, year, month, day, event_name):
     s3_key = f"tables/{entity_type}/year={year}/month={month}/day={day}/{item['id']}.parquet"
     table_location = f"s3://{BUCKET_NAME}/tables/{entity_type}/"
     athena_table_name = entity_type
-    
+
     logger.info(f"Processing regular entity item for '{entity_type}' - {event_name}")
-    
+
     # Convert to DataFrame and write as Parquet
     df = create_dataframe_from_item(item)
     write_parquet_to_s3(df, s3_key)
-    
+
     # Ensure Glue table exists with Parquet format
     ensure_optimized_glue_table(athena_table_name, table_location, item, df)
 
 def create_dataframe_from_item(item):
     """Convert DynamoDB item to pandas DataFrame with intelligent type optimization"""
     df = pd.DataFrame([item])
-    
+
     # Optimize data types with proper timestamp handling
     for column in df.columns:
         if column.startswith('_partition_'):
             continue
-            
+
         # Only handle timestamp fields if they are actual ISO 8601 timestamps (AWSDateTime)
         if (isinstance(df[column].iloc[0], str) and is_iso_timestamp(df[column].iloc[0])):
             try:
@@ -485,7 +868,7 @@ def create_dataframe_from_item(item):
             except Exception as e:
                 logger.warning(f"Failed to convert timestamp field '{column}': {e}")
                 df[column] = df[column].astype('string')
-        
+
         # Optimize numeric types
         elif df[column].dtype == 'object':
             try:
@@ -501,13 +884,13 @@ def create_dataframe_from_item(item):
                     df[column] = df[column].astype('string')
             except:
                 df[column] = df[column].astype('string')
-        
+
         # Convert other types to minimal representations
         elif df[column].dtype == 'int64':
             df[column] = df[column].astype('int32')
         elif df[column].dtype == 'float64':
             df[column] = df[column].astype('float32')
-    
+
     return df
 
 def is_iso_timestamp(value):
@@ -525,12 +908,12 @@ def write_parquet_to_s3(df, s3_key):
     try:
         # Convert DataFrame to PyArrow table
         table = pa.Table.from_pandas(df, preserve_index=False)
-        
+
         # Create ultra-minimal schema for maximum compression
         ultra_minimal_schema = []
         for i, field in enumerate(table.schema):
             col_data = table.column(i).to_pylist()
-            
+
             # Handle timestamp fields with native timestamp type
             if pd.api.types.is_datetime64_any_dtype(df.iloc[:, i]):
                 minimal_field = pa.field(field.name, pa.timestamp('ns', tz='UTC'))
@@ -550,17 +933,17 @@ def write_parquet_to_s3(df, s3_key):
                 minimal_field = pa.field(field.name, pa.float32())
             else:
                 minimal_field = pa.field(field.name, pa.string())
-            
+
             ultra_minimal_schema.append(minimal_field)
-        
+
         # Create table with ultra-minimal schema
-        minimal_table = pa.table([table.column(i) for i in range(len(ultra_minimal_schema))], 
+        minimal_table = pa.table([table.column(i) for i in range(len(ultra_minimal_schema))],
                                 schema=pa.schema(ultra_minimal_schema))
-        
+
         # Write optimized Parquet with SNAPPY compression
         parquet_buffer = BytesIO()
         pq.write_table(
-            minimal_table, 
+            minimal_table,
             parquet_buffer,
             compression='snappy',
             use_dictionary=False,
@@ -568,7 +951,7 @@ def write_parquet_to_s3(df, s3_key):
             version='2.6'
         )
         parquet_buffer.seek(0)
-        
+
         # Upload to S3
         s3_client.put_object(
             Bucket=BUCKET_NAME,
@@ -576,10 +959,10 @@ def write_parquet_to_s3(df, s3_key):
             Body=parquet_buffer.getvalue(),
             ContentType='application/octet-stream'
         )
-        
+
         parquet_size = len(parquet_buffer.getvalue())
         logger.info(f"Successfully wrote optimized Parquet: {s3_key} ({parquet_size} bytes)")
-        
+
     except Exception as e:
         logger.error(f"Error writing Parquet to S3: {str(e)}")
         raise
@@ -601,23 +984,23 @@ def create_parquet_glue_table(table_name, location, sample_item, df):
     for column_name in df.columns:
         if column_name.startswith('_partition_'):
             continue
-            
+
         column_type = infer_glue_type_from_dataframe(df, column_name)
         columns.append({
             'Name': column_name,
             'Type': column_type
         })
-    
+
     # Add partition columns
     partition_keys = [
         {'Name': 'year', 'Type': 'string'},
         {'Name': 'month', 'Type': 'string'},
         {'Name': 'day', 'Type': 'string'}
     ]
-    
+
     # Build storage template for partition projection
     storage_template = f"{location}year=${{year}}/month=${{month}}/day=${{day}}/"
-    
+
     # Create Parquet table with partition projection
     glue_client.create_table(
         DatabaseName=GLUE_DATABASE,
@@ -657,13 +1040,13 @@ def create_parquet_glue_table(table_name, location, sample_item, df):
             }
         }
     )
-    
+
     logger.info(f"Successfully created Parquet table '{table_name}' with partition projection")
 
 def infer_glue_type_from_dataframe(df, column_name):
     """Infer Glue data type from DataFrame column dtype"""
     column_dtype = df[column_name].dtype
-    
+
     if pd.api.types.is_datetime64_any_dtype(column_dtype):
         return 'timestamp'
     elif pd.api.types.is_bool_dtype(column_dtype):
@@ -742,12 +1125,15 @@ def format_date_parts(date_obj):
 
 ### Runtime & Memory Allocation
 
-| **Function Type** | **Runtime**  | **Memory** | **Timeout** | **Concurrency** |
-| ----------------- | ------------ | ---------- | ----------- | --------------- |
-| CRUD Operations   | Node.js 18.x | 128 MB     | 30 seconds  | 1000            |
-| SQL Queries       | Node.js 18.x | 256 MB     | 5 minutes   | 100             |
-| Resolvers         | Node.js 18.x | 512 MB     | 5 minutes   | 100             |
-| Stream Processor  | Python 3.11  | 1024 MB    | 5 minutes   | 10              |
+| **Function Type**   | **Runtime**  | **Memory** | **Timeout** | **Concurrency** |
+| ------------------- | ------------ | ---------- | ----------- | --------------- |
+| CRUD Operations     | Node.js 18.x | 128 MB     | 30 seconds  | 1000            |
+| SQL Queries         | Node.js 18.x | 256 MB     | 5 minutes   | 100             |
+| Task Mutations      | Node.js 18.x | 256 MB     | 30 seconds  | 100             |
+| Task Result Queries | Node.js 18.x | 256 MB     | 30 seconds  | 100             |
+| Execution Tracker   | Node.js 18.x | 256 MB     | 5 minutes   | 100             |
+| Resolvers           | Node.js 18.x | 512 MB     | 5 minutes   | 100             |
+| Stream Processor    | Python 3.11  | 1024 MB    | 5 minutes   | 10              |
 
 ### Environment Variables
 

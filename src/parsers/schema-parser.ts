@@ -37,6 +37,7 @@ export interface FieldMetadata {
   arguments?: ArgumentMetadata[];
   sqlQuery?: SqlQueryDirective;
   returnValue?: ReturnDirective;
+  isTask?: boolean;
 }
 
 export interface TypeMetadata {
@@ -44,6 +45,7 @@ export interface TypeMetadata {
   fields: FieldMetadata[];
   isResolver?: boolean;
   isPrimitive: boolean;
+  isTaskResponse?: boolean;
 }
 
 export interface SchemaMetadata {
@@ -103,6 +105,7 @@ export class SchemaParser {
     virtualTables: Set<string>
   ): TypeMetadata {
     const isResolver = this.hasDirective("resolver", typeDef.directives);
+    const isTaskResponse = this.hasDirective("task_response", typeDef.directives);
     const isPrimitive = this.isPrimitiveType(typeDef.name.value);
 
     return {
@@ -110,6 +113,7 @@ export class SchemaParser {
       fields: this.parseFields(typeDef.fields || [], virtualTables),
       isResolver,
       isPrimitive,
+      isTaskResponse,
     };
   }
 
@@ -122,6 +126,7 @@ export class SchemaParser {
       const sqlQuery = this.extractSqlQueryDirective(field.directives);
       const returnValue = this.extractReturnDirective(field.directives);
       const fieldArguments = this.extractFieldArguments(field.arguments);
+      const isTask = this.hasDirective("task", field.directives);
 
       // Extract virtual tables from SQL queries
       if (sqlQuery?.query) {
@@ -136,6 +141,7 @@ export class SchemaParser {
         arguments: fieldArguments.length > 0 ? fieldArguments : undefined,
         sqlQuery,
         returnValue,
+        isTask,
       };
     });
   }
@@ -267,3 +273,4 @@ export class SchemaParser {
     return primitiveTypes.includes(typeName);
   }
 }
+ 

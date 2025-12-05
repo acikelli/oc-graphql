@@ -11,6 +11,8 @@ export async function validateSchema(schemaString: string): Promise<void> {
       directive @sql_query(query: String!) on FIELD_DEFINITION
       directive @resolver on OBJECT
       directive @return(value: String!) on FIELD_DEFINITION
+      directive @task on FIELD_DEFINITION
+      directive @task_response on OBJECT
     `;
 
     const schemaWithDirectives = directiveDefinitions + "\n" + schemaString;
@@ -43,6 +45,8 @@ function validateCustomDirectives(schemaString: string): void {
     "@sql_query",
     "@resolver",
     "@return",
+    "@task",
+    "@task_response",
     "@skip",
     "@include",
     "@deprecated",
@@ -127,6 +131,80 @@ function validateTypeStructure(schemaString: string): void {
       // Type not found - this could be a custom type that needs to be defined
       // For now, we'll skip this warning to avoid console dependency
     }
+  }
+
+  // Validate @task directive usage
+  validateTaskDirective(schemaString);
+}
+
+function validateTaskDirective(schemaString: string): void {
+  // Extract all Query fields with @task directive
+  const queryTypePattern = /type\s+Query\s*{([\s\S]*?)}/;
+  const queryMatch = schemaString.match(queryTypePattern);
+  
+  if (!queryMatch) {
+    return; // No Query type found
+  }
+
+  const queryFields = queryMatch[1];
+  
+  // Find all fields that have @task directive
+  // Pattern: fieldName(args): ReturnType ... @task ...
+  // We need to match the field definition and extract the return type
+  // The return type can be: Type, Type!, [Type!]!, etc.
+  
+  // Find all occurrences of @task in Query fields
+  const taskMatches = [...queryFields.matchAll(/@task/g)];
+  
+  for (const taskMatch of taskMatches) {
+    const taskIndex = taskMatch.index!;
+    
+    // Look backwards from @task to find the field definition
+    const beforeTask = queryFields.substring(0, taskIndex);
+    
+    // Find the field definition - look for pattern: fieldName(args): ReturnType
+    // We need to find the last field definition before @task
+    const fieldDefPattern = /(\w+)\s*\([^)]*\)\s*:\s*(\[?)(\w+)([!?]*)(\]?)([!?]*)/g;
+    let lastMatch: RegExpMatchArray | null = null;
+    let match: RegExpMatchArray | null;
+    
+    // Find all field definitions before @task
+    while ((match = fieldDefPattern.exec(beforeTask)) !== null) {
+      lastMatch = match;
+    }
+    
+    if (lastMatch) {
+      const fieldName = lastMatch[1];
+      const returnType = lastMatch[3]; // Extract the type name (e.g., "User" from "[User!]!")
+      
+      // Skip built-in types
+      const builtInTypes = ['String', 'Int', 'Float', 'Boolean', 'ID', 'AWSDateTime'];
+      if (!builtInTypes.includes(returnType)) {
+        validateTaskResponseType(schemaString, fieldName, returnType);
+      }
+    }
+  }
+
+  // Check that @task is only used on Query fields (not Mutation)
+  const mutationTypePattern = /type\s+Mutation\s*{([\s\S]*?)}/;
+  const mutationMatch = schemaString.match(mutationTypePattern);
+  
+  if (mutationMatch) {
+    const mutationFields = mutationMatch[1];
+    if (mutationFields.includes('@task')) {
+      throw new Error('@task directive can only be used on Query fields, not Mutation fields');
+    }
+  }
+}
+
+function validateTaskResponseType(schemaString: string, fieldName: string, returnType: string): void {
+  // Check if return type has @task_response directive
+  // Match: type User @task_response { ... } or type User @task_response{ ... }
+  const typePattern = new RegExp(`type\\s+${returnType}\\s+@task_response[^{]*{`, 's');
+  if (!typePattern.test(schemaString)) {
+    throw new Error(
+      `@task directive on Query field "${fieldName}" requires its return type "${returnType}" to have @task_response directive`
+    );
   }
 }
 

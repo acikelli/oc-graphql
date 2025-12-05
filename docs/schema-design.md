@@ -130,7 +130,201 @@ type UserAnalytics @resolver {
 }
 ```
 
-### 3. `@return` - Static Value Returns
+### 3. `@task` - Long-Running Query Tasks
+
+Handle queries that may exceed AppSync's 30-second timeout by executing them asynchronously.
+
+```graphql
+directive @task on FIELD_DEFINITION
+directive @task_response on OBJECT
+```
+
+#### Requirements
+
+- `@task` can **only** be used on `Query` fields (not `Mutation`)
+- The return type **must** have the `@task_response` directive
+- Types with `@task_response` do **not** generate CRUD operations (they only serve as response types)
+
+#### Usage
+
+When applied to a query with `@sql_query`, the framework automatically generates:
+
+- **Mutation**: `triggerTask<QueryName>` - Starts the task and returns a `taskId` (which is the Athena execution ID)
+- **Query**: `taskResult<QueryName>` - Polls task status and retrieves results
+
+#### How It Works
+
+1. **Task Creation**: Calling `triggerTask<QueryName>` creates a task entity in DynamoDB and starts Athena query execution
+2. **Task ID**: The Athena execution ID is used as the task ID (one query per task)
+3. **Execution Tracking**: EventBridge Lambda automatically updates task status as queries complete
+4. **Result Retrieval**: Use `taskResult<QueryName>` to poll for completion and retrieve results
+
+#### Usage Examples
+
+##### Basic Task Query
+
+```graphql
+type Query {
+  # Long-running analytics query
+  generateYearlyReport(year: Int!): [ReportData!]!
+    @sql_query(
+      query: """
+      SELECT
+        month,
+        COUNT(*) as total_orders,
+        SUM(amount) as total_revenue,
+        AVG(amount) as avg_order_value
+      FROM orders
+      WHERE year = $args.year
+      GROUP BY month
+      ORDER BY month
+      """
+    )
+    @task
+}
+
+# Response type must have @task_response directive
+type ReportData @task_response {
+  month: Int!
+  totalOrders: Int!
+  totalRevenue: Float!
+  avgOrderValue: Float!
+}
+```
+
+**Generated Operations:**
+
+```graphql
+# Mutation to trigger the task
+type Mutation {
+  triggerTaskGenerateYearlyReport(year: Int!): TaskTriggerResult!
+}
+
+# Query to check task status and get results
+type Query {
+  taskResultGenerateYearlyReport(taskId: ID!): TaskResultGenerateYearlyReport!
+}
+
+type TaskTriggerResult {
+  taskId: ID! # This is the Athena execution ID
+}
+
+type TaskResultGenerateYearlyReport {
+  taskStatus: TaskStatus!
+  result: [ReportData!] # Null if still running or failed
+  startDate: AWSDateTime!
+  finishDate: AWSDateTime # Null if still running
+}
+
+enum TaskStatus {
+  RUNNING
+  SUCCEEDED
+  FAILED
+}
+```
+
+##### Usage Flow
+
+```graphql
+# 1. Trigger the task
+mutation {
+  triggerTaskGenerateYearlyReport(year: 2024) {
+    taskId # This is the Athena execution ID
+  }
+}
+
+# 2. Poll for results (repeat until taskStatus is SUCCEEDED or FAILED)
+query {
+  taskResultGenerateYearlyReport(taskId: "abc-123-def-456") {
+    taskStatus
+    startDate
+    finishDate
+    result {
+      month
+      totalOrders
+      totalRevenue
+      avgOrderValue
+    }
+  }
+}
+```
+
+#### Task Entity Structure
+
+Tasks are stored in DynamoDB with the following structure:
+
+```javascript
+{
+  PK: "task#<executionId>",
+  SK: "task#<executionId>",
+  id: "<executionId>", // Same as Athena execution ID
+  entityType: "task",
+  entityId: "<executionId>",
+  taskStatus: "RUNNING", // RUNNING, SUCCEEDED, FAILED
+  startDate: "2024-01-15T10:00:00Z",
+  finishDate: null, // Set when task completes
+  createdAt: "2024-01-15T10:00:00Z",
+  updatedAt: "2024-01-15T10:00:00Z"
+}
+```
+
+#### Execution Tracking
+
+The framework uses a hybrid approach for tracking Athena query executions:
+
+1. **EventBridge Integration**: Native Athena Query State Change events automatically update task status
+2. **Polling Fallback** (Always Active): The `taskResult` query polls Athena directly if EventBridge hasn't updated the status, ensuring tasks never get stuck
+
+**How it works:**
+
+- When you call `taskResult`, it first checks DynamoDB for task status
+- If the task is still `RUNNING`/`QUEUED`, it polls Athena's `GetQueryExecution` API directly
+- Task entity is automatically updated with the latest status and finish date
+- Results are retrieved directly from Athena when the task succeeds
+
+This ensures reliable task tracking even without EventBridge configuration.
+
+#### Best Practices
+
+1. **Use for Long-Running Queries**: Only apply `@task` to queries that may exceed 30 seconds
+2. **Response Type Validation**: Always mark response types with `@task_response` directive
+3. **Polling Strategy**: Implement exponential backoff when polling `taskResult` queries
+4. **Error Handling**: Check `taskStatus` for `FAILED` and handle errors appropriately
+5. **Result Nullability**: The `result` field is nullable - check `taskStatus` before accessing results
+
+```graphql
+# Good: Long-running analytics query with @task_response type
+type Query {
+  analyzeCustomerBehavior(
+    startDate: AWSDateTime!
+    endDate: AWSDateTime!
+  ): [AnalysisResult!]!
+    @sql_query(query: "SELECT ... complex multi-table join ...")
+    @task
+}
+
+type AnalysisResult @task_response {
+  customerId: ID!
+  totalOrders: Int!
+  averageOrderValue: Float!
+}
+
+# Avoid: Fast queries don't need @task
+type Query {
+  getUser(id: ID!): User
+    @sql_query(query: "SELECT * FROM user WHERE id = $args.id")
+  # No @task needed - completes in < 1 second
+}
+
+# Error: @task cannot be used on Mutation
+type Mutation {
+  createReport(input: ReportInput!): Report!
+    @sql_query(query: "INSERT INTO ...")
+    @task # ❌ Invalid - @task only works on Query fields
+}
+```
+
+### 4. `@return` - Static Value Returns
 
 Return computed or static values without database queries.
 

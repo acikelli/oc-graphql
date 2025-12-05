@@ -122,17 +122,21 @@ The framework automatically generates and deploys:
 
 ### Function Types Generated
 
-| **Function Type** | **Count**              | **Runtime**  | **Memory** | **Timeout** | **Purpose**               | **Example**                       |
-| ----------------- | ---------------------- | ----------- | ---------- | ----------- | ------------------------- | --------------------------------- |
-| CRUD Operations   | 4 per entity           | Node.js 18.x | 128 MB     | 30 seconds  | Basic database operations | `OCG-api-create-user`             |
-| SQL Queries       | 1 per @sql_query       | Node.js 18.x | 256 MB     | 5 minutes   | Custom analytics          | `OCG-api-query-getTrendingPosts`  |
-| Resolvers         | 1 per @resolver type   | Node.js 18.x | 512 MB     | 5 minutes   | Complex type resolution   | `OCG-api-resolver-postconnection` |
-| Field Resolvers   | 1 per @sql_query field | Node.js 18.x | 256 MB     | 5 minutes   | Individual field queries  | `OCG-api-field-user-totalPosts`   |
-| Stream Processor  | 1 per project          | Python 3.11  | 1024 MB    | 5 minutes   | Real-time data pipeline   | `OCG-api-stream-processor`        |
+| **Function Type**   | **Count**                      | **Runtime**  | **Memory** | **Timeout** | **Purpose**               | **Example**                          |
+| ------------------- | ------------------------------ | ------------ | ---------- | ----------- | ------------------------- | ------------------------------------ |
+| CRUD Operations     | 4 per entity                   | Node.js 18.x | 128 MB     | 30 seconds  | Basic database operations | `OCG-api-create-user`                |
+| SQL Queries         | 1 per @sql_query               | Node.js 18.x | 256 MB     | 5 minutes   | Custom analytics          | `OCG-api-query-getTrendingPosts`     |
+| Task Mutations      | 1 per @task query              | Node.js 18.x | 256 MB     | 30 seconds  | Trigger async tasks       | `OCG-api-mutation-triggerTaskReport` |
+| Task Result Queries | 1 per @task query              | Node.js 18.x | 256 MB     | 30 seconds  | Poll task results         | `OCG-api-query-taskResultReport`     |
+| Execution Tracker   | 1 per project (if tasks exist) | Node.js 18.x | 256 MB     | 5 minutes   | Track Athena executions   | `OCG-api-athena-execution-tracker`   |
+| Resolvers           | 1 per @resolver type           | Node.js 18.x | 512 MB     | 5 minutes   | Complex type resolution   | `OCG-api-resolver-postconnection`    |
+| Field Resolvers     | 1 per @sql_query field         | Node.js 18.x | 256 MB     | 5 minutes   | Individual field queries  | `OCG-api-field-user-totalPosts`      |
+| Stream Processor    | 1 per project                  | Python 3.11  | 1024 MB    | 5 minutes   | Real-time data pipeline   | `OCG-api-stream-processor`           |
 
 **Function Naming Pattern**: `OCG-{project}-{category}-{identifier}`
 
 All functions are automatically configured with:
+
 - Environment variables for DynamoDB, S3, Athena, and Glue access
 - IAM roles with least-privilege permissions
 - Connection reuse and retry logic for optimal performance
@@ -191,6 +195,48 @@ type UserAnalytics @resolver {
 }
 ```
 
+### `@task` - Long-Running Query Tasks
+
+Handle queries that may exceed AppSync's 30-second timeout by executing them asynchronously.
+
+**Requirements:**
+
+- `@task` can only be used on `Query` fields (not `Mutation`)
+- The return type must have the `@task_response` directive
+- Types with `@task_response` do not generate CRUD operations
+
+```graphql
+type Query {
+  generateYearlyReport(year: Int!): [ReportData!]!
+    @sql_query(
+      query: """
+      SELECT month, COUNT(*) as orders, SUM(amount) as revenue
+      FROM orders WHERE year = $args.year
+      GROUP BY month ORDER BY month
+      """
+    )
+    @task
+}
+
+type ReportData @task_response {
+  month: Int!
+  orders: Int!
+  revenue: Float!
+}
+```
+
+**Generated Operations:**
+
+- `triggerTaskGenerateYearlyReport(year: Int!): TaskTriggerResult!` - Start the task, returns `taskId`
+- `taskResultGenerateYearlyReport(taskId: ID!): TaskResultGenerateYearlyReport!` - Poll for results
+
+**Task Result Response:**
+
+- `taskStatus: TaskStatus!` - RUNNING, SUCCEEDED, or FAILED
+- `result: [ReportData!]` - Query results (null if still running or failed)
+- `startDate: AWSDateTime!` - When the query started
+- `finishDate: AWSDateTime` - When the query finished (null if still running)
+
 ### `@return` - Computed Values
 
 ```graphql
@@ -233,17 +279,20 @@ oc-graphql status -n my-project
 OC-GraphQL provides a complete abstraction layer over AWS services:
 
 ### Code Generation
+
 - **Automatic Lambda Functions**: Generates optimized Node.js and Python functions based on your schema
 - **Infrastructure as Code**: Uses AWS CDK to define and deploy all resources
 - **Type-Safe Resolvers**: Auto-generates AppSync resolvers with proper type mapping
 
 ### Built-in Patterns
+
 - **Single-Table DynamoDB**: Optimized key structure for efficient queries
 - **Parquet Data Pipeline**: Real-time stream processing with intelligent type detection
 - **SQL Query Abstraction**: Direct SQL in GraphQL with automatic parameter sanitization
 - **Connection Management**: Optimized AWS SDK usage with connection pooling
 
 ### Operational Excellence
+
 - **Auto-scaling**: All components scale automatically based on demand
 - **Monitoring**: CloudWatch integration for metrics, logs, and alarms
 - **Security**: Built-in IAM policies, SQL injection protection, and encryption
