@@ -13,6 +13,8 @@ import * as lambda from "aws-cdk-lib/aws-lambda";
 import * as s3 from "aws-cdk-lib/aws-s3";
 import * as iam from "aws-cdk-lib/aws-iam";
 import * as glue from "aws-cdk-lib/aws-glue";
+import * as events from "aws-cdk-lib/aws-events";
+import * as targets from "aws-cdk-lib/aws-events-targets";
 import { DynamoEventSource } from "aws-cdk-lib/aws-lambda-event-sources";
 import { SchemaMetadata } from "../parsers/schema-parser";
 import * as path from "path";
@@ -231,6 +233,42 @@ export class OcGraphQLStack extends Stack {
         retryAttempts: 3,
       })
     );
+
+    // Create EventBridge Lambda and rule for tracking Athena query executions (if any tasks exist)
+    const hasTasks = schemaMetadata.queries.some((q) => q.isTask);
+    if (hasTasks) {
+      const athenaExecutionTrackerFunctionName = `${projectName}-athena-execution-tracker`;
+      const athenaExecutionTracker =
+        lambdaFunctions[athenaExecutionTrackerFunctionName];
+
+      if (athenaExecutionTracker) {
+        // Create EventBridge rule to track Athena query state changes
+        // Athena emits native EventBridge events when query state changes
+        // The taskResult query also polls Athena directly as a fallback
+        const athenaRule = new events.Rule(this, "AthenaQueryStateChangeRule", {
+          eventPattern: {
+            source: ["aws.athena"],
+            detailType: ["Athena Query State Change"],
+            detail: {
+              currentState: ["SUCCEEDED", "FAILED", "CANCELLED"],
+            },
+          },
+          description:
+            "Track Athena query execution state changes for task tracking. Falls back to polling in taskResult query if EventBridge is unavailable.",
+          enabled: true,
+        });
+
+        athenaRule.addTarget(
+          new targets.LambdaFunction(athenaExecutionTracker)
+        );
+
+        // Grant EventBridge permission to invoke the Lambda
+        athenaExecutionTracker.addPermission("EventBridgeInvoke", {
+          principal: new iam.ServicePrincipal("events.amazonaws.com"),
+          sourceArn: athenaRule.ruleArn,
+        });
+      }
+    }
   }
 
   private createLambdaFunctions(
@@ -361,6 +399,69 @@ export class OcGraphQLStack extends Stack {
       }
     }
 
+    // Task mutation functions (triggerTask)
+    for (const query of schemaMetadata.queries) {
+      if (query.isTask && query.sqlQuery) {
+        const capitalizedName =
+          query.name.charAt(0).toUpperCase() + query.name.slice(1);
+        const functionName = `${projectName}-mutation-triggerTask${capitalizedName}`;
+        functions[functionName] = new lambda.Function(
+          this,
+          `TriggerTask${capitalizedName}Function`,
+          {
+            functionName: `OCG-${functionName}`,
+            runtime: lambda.Runtime.NODEJS_18_X,
+            handler: `ocg-${functionName}.handler`,
+            code: lambda.Code.fromAsset(generatedCodePath),
+            role,
+            environment: commonEnvironment,
+            timeout: Duration.seconds(30),
+          }
+        );
+      }
+    }
+
+    // Task result query functions (taskResult)
+    for (const query of schemaMetadata.queries) {
+      if (query.isTask && query.sqlQuery) {
+        const capitalizedName =
+          query.name.charAt(0).toUpperCase() + query.name.slice(1);
+        const functionName = `${projectName}-query-taskResult${capitalizedName}`;
+        functions[functionName] = new lambda.Function(
+          this,
+          `TaskResult${capitalizedName}Function`,
+          {
+            functionName: `OCG-${functionName}`,
+            runtime: lambda.Runtime.NODEJS_18_X,
+            handler: `ocg-${functionName}.handler`,
+            code: lambda.Code.fromAsset(generatedCodePath),
+            role,
+            environment: commonEnvironment,
+            timeout: Duration.seconds(30),
+          }
+        );
+      }
+    }
+
+    // Athena execution tracker Lambda
+    const hasTasks = schemaMetadata.queries.some((q) => q.isTask);
+    if (hasTasks) {
+      const functionName = `${projectName}-athena-execution-tracker`;
+      functions[functionName] = new lambda.Function(
+        this,
+        "AthenaExecutionTrackerFunction",
+        {
+          functionName: `OCG-${functionName}`,
+          runtime: lambda.Runtime.NODEJS_18_X,
+          handler: `ocg-${functionName}.handler`,
+          code: lambda.Code.fromAsset(generatedCodePath),
+          role,
+          environment: commonEnvironment,
+          timeout: Duration.minutes(5),
+        }
+      );
+    }
+
     return functions;
   }
 
@@ -410,9 +511,9 @@ export class OcGraphQLStack extends Stack {
       }
     }
 
-    // Custom query resolvers
+    // Custom query resolvers (skip if it's a task query - those use taskResult instead)
     for (const query of schemaMetadata.queries) {
-      if (query.sqlQuery) {
+      if (query.sqlQuery && !query.isTask) {
         const projectName = this.projectName;
         const functionName = `${projectName}-query-${query.name}`;
         if (dataSources[functionName]) {
@@ -420,6 +521,25 @@ export class OcGraphQLStack extends Stack {
             typeName: "Query",
             fieldName: query.name,
           });
+        }
+      }
+    }
+
+    // Task result query resolvers
+    for (const query of schemaMetadata.queries) {
+      if (query.isTask && query.sqlQuery) {
+        const projectName = this.projectName;
+        const capitalizedName =
+          query.name.charAt(0).toUpperCase() + query.name.slice(1);
+        const functionName = `${projectName}-query-taskResult${capitalizedName}`;
+        if (dataSources[functionName]) {
+          dataSources[functionName].createResolver(
+            `taskResult${capitalizedName}Resolver`,
+            {
+              typeName: "Query",
+              fieldName: `taskResult${capitalizedName}`,
+            }
+          );
         }
       }
     }
@@ -434,6 +554,25 @@ export class OcGraphQLStack extends Stack {
             typeName: "Mutation",
             fieldName: mutation.name,
           });
+        }
+      }
+    }
+
+    // Task trigger mutation resolvers
+    for (const query of schemaMetadata.queries) {
+      if (query.isTask && query.sqlQuery) {
+        const projectName = this.projectName;
+        const capitalizedName =
+          query.name.charAt(0).toUpperCase() + query.name.slice(1);
+        const functionName = `${projectName}-mutation-triggerTask${capitalizedName}`;
+        if (dataSources[functionName]) {
+          dataSources[functionName].createResolver(
+            `triggerTask${capitalizedName}Resolver`,
+            {
+              typeName: "Mutation",
+              fieldName: `triggerTask${capitalizedName}`,
+            }
+          );
         }
       }
     }

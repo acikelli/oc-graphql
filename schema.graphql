@@ -1,7 +1,8 @@
 scalar AWSDateTime
 
 type Query {
-  getUsersByCity(city: String!): [User!]!
+  getUsersByCity(city: String!): [UserTaskResponse]
+    @task
     @sql_query(
       query: "SELECT * FROM user u JOIN address a ON u.id = a.userId WHERE a.city = $args.city"
     )
@@ -14,10 +15,19 @@ type Mutation {
     )
 }
 
+type UserTaskResponse @task_response {
+  id: ID!
+  name: String!
+  email: String!
+  password: String!
+  createdAt: AWSDateTime!
+  updatedAt: AWSDateTime!
+}
+
 type UserFavoriteProductConnection @resolver {
   items: [Product!]!
     @sql_query(
-      query: "SELECT * FROM product p JOIN user_favorite_products ufp ON p.id = ufp.productId where ufp.userId = $source.userId OFFSET $args.offset LIMIT $args.limit "
+      query: "SELECT * FROM product p JOIN user_favorite_products ufp ON p.id = ufp.productId where ufp.userId = $source.id OFFSET $args.offset LIMIT $args.limit "
     )
   limit: Int! @return(value: "$args.limit")
   offset: Int! @return(value: "$args.offset")
@@ -54,9 +64,7 @@ type User {
   password: String!
   createdAt: AWSDateTime!
   updatedAt: AWSDateTime!
-  addresses(id: ID): [Address!]
-    @sql_query(
-      query: "SELECT * FROM address a WHERE CASE WHEN $args.id IS NOT NULL THEN a.userId = $args.id ELSE TRUE END"
-    )
+  addresses: [Address!]
+    @sql_query(query: "SELECT * FROM address a WHERE a.userId = $source.id ")
   favoriteProducts(limit: Int, offset: Int): UserFavoriteProductConnection
 }
