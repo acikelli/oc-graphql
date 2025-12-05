@@ -16,7 +16,7 @@ OC-GraphQL is a framework that abstracts AWS infrastructure complexity, automati
 
 - Direct SQL queries in GraphQL with `@sql_query` directive
 - Complex joins and aggregations via Amazon Athena
-- Virtual tables for many-to-many relationships
+- Join tables for many-to-many relationships
 
 ### **Advanced Data Pipeline**
 

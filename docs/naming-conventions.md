@@ -115,7 +115,7 @@ Examples:
 - PK: "user#123", SK: "user#123"
 - PK: "post#456", SK: "post#456"
 
-Virtual Tables (Relationships):
+Join Tables (Relationships):
 PK: "relation#{tableName}#{entity1Type}#{entity1Id}"
 SK: "relation#{tableName}#{entity2Type}#{entity2Id}"
 Examples:
@@ -148,10 +148,10 @@ Examples:
 - tables/post/year=2024/month=12/day=15/post-456.parquet
 ```
 
-##### Virtual Tables
+##### Join Tables
 
 ```
-Pattern: tables/{virtualTableName}/year={YYYY}/month={MM}/day={DD}/{compositeKey}.parquet
+Pattern: tables/{joinTableName}/year={YYYY}/month={MM}/day={DD}/{compositeKey}.parquet
 Examples:
 - tables/user_posts/year=2024/month=12/day=15/user_123_post_456.parquet
 - tables/user_followers/year=2024/month=12/day=15/user_123_user_789.parquet
@@ -180,8 +180,8 @@ Regular Entities:
 Pattern: {entityType}
 Examples: user, post, comment, article
 
-Virtual Tables:
-Pattern: {virtualTableName}
+Join Tables:
+Pattern: {joinTableName}
 Examples: user_posts, user_followers, post_tags
 ```
 
@@ -313,7 +313,7 @@ Used for:
 ```
 Used for:
 - Database names: my_blog_api_db
-- Virtual table names: user_posts
+- Join table names: user_posts
 - Glue table names: user_followers
 ```
 

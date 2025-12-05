@@ -15,6 +15,7 @@ OC-GraphQL automatically generates a comprehensive set of Lambda functions to ha
 7. **Resolver Functions** - Complex type resolution with multiple SQL queries
 8. **Field Resolver Functions** - Individual field-level SQL queries
 9. **Stream Processor** - DynamoDB to Parquet data pipeline
+10. **Cascade Deletion Listener** - SQS queue listener for cleaning up join table relations
 
 ## 📋 Function Naming Patterns
 
@@ -30,6 +31,7 @@ Examples:
 - OCG-blog-athena-execution-tracker
 - OCG-blog-resolver-postconnection
 - OCG-blog-stream-processor
+- OCG-blog-cascade-deletion-listener
 ```
 
 ## 🔧 Function Types & Implementation
@@ -692,7 +694,7 @@ exports.handler = async (event) => {
 
 ### 8. Stream Processor (Python 3.11)
 
-Real-time DynamoDB to Parquet conversion with advanced optimization, virtual table support, and automatic Glue table management.
+Real-time DynamoDB to Parquet conversion with advanced optimization, join table support, and automatic Glue table management.
 
 ```python
 # Pattern: OCG-{project}-stream-processor
@@ -750,7 +752,7 @@ def process_record(record):
         logger.error(f"Error processing stream record: {str(e)}")
 
 def handle_delete_operation(record, current_date, year, month, day):
-    """Handle DELETE operations by removing Parquet files from S3"""
+    """Handle DELETE operations by removing Parquet files from S3 and triggering cascade deletion"""
     if 'OldImage' not in record.get('dynamodb', {}):
         return
 
@@ -761,9 +763,9 @@ def handle_delete_operation(record, current_date, year, month, day):
         return
 
     # Determine S3 key for deletion with date partitioning
-    if item.get('virtualTable'):
-        # Virtual table: use composite key from PK/SK
-        virtual_table = item['virtualTable']
+    if item.get('joinTable'):
+        # Join table: use composite key from PK/SK
+        join_table = item['joinTable']
         pk_parts = item['PK'].split('#')
         sk_parts = item['SK'].split('#')
         key_components = pk_parts[2:] + sk_parts[2:]
@@ -773,21 +775,32 @@ def handle_delete_operation(record, current_date, year, month, day):
         item_date = parse_item_date(item.get('createdAt'), current_date)
         item_year, item_month, item_day = format_date_parts(item_date)
 
-        s3_key = f"tables/{virtual_table}/year={item_year}/month={item_month}/day={item_day}/{key_string}.parquet"
+        s3_key = f"tables/{join_table}/year={item_year}/month={item_month}/day={item_day}/{key_string}.parquet"
+
+        logger.info(f"Deleting join table S3 object: {s3_key}")
+
+        try:
+            s3_client.delete_object(Bucket=BUCKET_NAME, Key=s3_key)
+            logger.info(f"Successfully deleted join table S3 object: {s3_key}")
+        except Exception as e:
+            logger.warning(f"S3 object may not exist or already deleted: {s3_key} - {str(e)}")
     else:
-        # Regular entity: use ID
+        # Regular entity: use ID and trigger cascade deletion
         item_date = parse_item_date(item.get('createdAt'), current_date)
         item_year, item_month, item_day = format_date_parts(item_date)
 
         s3_key = f"tables/{entity_type}/year={item_year}/month={item_month}/day={item_day}/{item['id']}.parquet"
 
-    logger.info(f"Deleting S3 object: {s3_key}")
+        logger.info(f"Deleting entity S3 object: {s3_key}")
 
-    try:
-        s3_client.delete_object(Bucket=BUCKET_NAME, Key=s3_key)
-        logger.info(f"Successfully deleted S3 object: {s3_key}")
-    except Exception as e:
-        logger.warning(f"S3 object may not exist or already deleted: {s3_key} - {str(e)}")
+        try:
+            s3_client.delete_object(Bucket=BUCKET_NAME, Key=s3_key)
+            logger.info(f"Successfully deleted entity S3 object: {s3_key}")
+        except Exception as e:
+            logger.warning(f"S3 object may not exist or already deleted: {s3_key} - {str(e)}")
+
+        # Send message to SQS for cascade deletion of join relations
+        send_cascade_deletion_message(entity_type, item.get('id'))
 
 def handle_insert_update_operation(record, event_name, current_date, year, month, day):
     """Handle INSERT and MODIFY operations by creating/updating Parquet files"""
@@ -808,25 +821,25 @@ def handle_insert_update_operation(record, event_name, current_date, year, month
     item['_partition_month'] = month
     item['_partition_day'] = day
 
-    if item.get('virtualTable'):
-        handle_virtual_table_item(item, year, month, day, event_name)
+    if item.get('joinTable'):
+        handle_join_table_item(item, year, month, day, event_name)
     else:
         handle_regular_entity_item(item, entity_type, year, month, day, event_name)
 
-def handle_virtual_table_item(item, year, month, day, event_name):
-    """Handle virtual table items (many-to-many relationships) with date partitioning"""
-    virtual_table = item['virtualTable']
+def handle_join_table_item(item, year, month, day, event_name):
+    """Handle join table items (many-to-many relationships) with date partitioning"""
+    join_table = item['joinTable']
     pk_parts = item['PK'].split('#')
     sk_parts = item['SK'].split('#')
 
     key_components = pk_parts[2:] + sk_parts[2:]
     key_string = '_'.join(key_components)
 
-    s3_key = f"tables/{virtual_table}/year={year}/month={month}/day={day}/{key_string}.parquet"
-    table_location = f"s3://{BUCKET_NAME}/tables/{virtual_table}/"
-    athena_table_name = virtual_table
+    s3_key = f"tables/{join_table}/year={year}/month={month}/day={day}/{key_string}.parquet"
+    table_location = f"s3://{BUCKET_NAME}/tables/{join_table}/"
+    athena_table_name = join_table
 
-    logger.info(f"Processing virtual table item for '{virtual_table}' - {event_name}")
+    logger.info(f"Processing join table item for '{join_table}' - {event_name}")
 
     # Convert to DataFrame and write as Parquet
     df = create_dataframe_from_item(item)
@@ -1114,26 +1127,119 @@ def format_date_parts(date_obj):
 **Key Features:**
 
 - **Full CRUD Support**: Handles INSERT, MODIFY, and REMOVE operations
-- **Virtual Table Support**: Automatically handles many-to-many relationship tables
+- **Join Table Support**: Automatically handles many-to-many relationship tables
 - **Intelligent Type Detection**: Converts ISO 8601 timestamps to native datetime, optimizes numeric types
 - **Automatic Glue Table Creation**: Creates Parquet tables with partition projection for optimal query performance
 - **Date Partitioning**: Organizes data by year/month/day for efficient query pruning
 - **Ultra-Minimal Parquet Schema**: Uses smallest possible data types for maximum compression
 - **Error Resilience**: Continues processing other records if one fails
+- **Cascade Deletion**: Sends SQS messages for entity deletions to trigger join table cleanup
+
+### 9. Cascade Deletion Listener (Node.js 18.x)
+
+SQS queue listener that automatically cleans up join table relations and S3 files when entities are deleted.
+
+```javascript
+// Pattern: OCG-{project}-cascade-deletion-listener
+// Example: OCG-blog-cascade-deletion-listener
+
+const {
+  DynamoDBClient,
+  QueryCommand,
+  DeleteItemCommand,
+} = require("@aws-sdk/client-dynamodb");
+const { S3Client, DeleteObjectsCommand } = require("@aws-sdk/client-s3");
+const { unmarshall } = require("@aws-sdk/util-dynamodb");
+
+exports.handler = async (event) => {
+  // Process SQS messages for cascade deletion
+  for (const record of event.Records) {
+    const { entityType, entityId } = JSON.parse(record.body);
+
+    // Query all joinRelation items for this entity
+    const pk = `joinRelation#${entityType}#${entityId}`;
+    const queryResult = await dynamoClient.send(
+      new QueryCommand({
+        TableName: TABLE_NAME,
+        KeyConditionExpression: "PK = :pk",
+        ExpressionAttributeValues: { ":pk": { S: pk } },
+      })
+    );
+
+    // Collect S3 keys to delete
+    const s3KeysToDelete = [];
+    const joinRelationItems = [];
+
+    for (const item of queryResult.Items) {
+      const unmarshalled = unmarshall(item);
+      joinRelationItems.push(unmarshalled);
+      if (unmarshalled.s3Key) {
+        s3KeysToDelete.push({ Key: unmarshalled.s3Key });
+      }
+    }
+
+    // Bulk delete S3 objects (max 1000 per request)
+    if (s3KeysToDelete.length > 0) {
+      const chunks = [];
+      for (let i = 0; i < s3KeysToDelete.length; i += 1000) {
+        chunks.push(s3KeysToDelete.slice(i, i + 1000));
+      }
+
+      for (const chunk of chunks) {
+        await s3Client.send(
+          new DeleteObjectsCommand({
+            Bucket: BUCKET_NAME,
+            Delete: { Objects: chunk },
+          })
+        );
+      }
+    }
+
+    // Delete joinRelation items from DynamoDB
+    for (const item of joinRelationItems) {
+      await dynamoClient.send(
+        new DeleteItemCommand({
+          TableName: TABLE_NAME,
+          Key: { PK: { S: item.PK }, SK: { S: item.SK } },
+        })
+      );
+    }
+  }
+};
+```
+
+**Key Features:**
+
+- **SQS Integration**: Listens to cascade deletion queue for entity deletion events
+- **Bulk S3 Deletion**: Efficiently deletes up to 1000 S3 objects per request
+- **Automatic Cleanup**: Removes both S3 Parquet files and DynamoDB joinRelation items
+- **Error Resilience**: Continues processing even if individual deletions fail
+
+**How Cascade Deletion Works:**
+
+1. **Entity Deletion**: When a regular entity (e.g., `User`) is deleted, the stream processor detects the `REMOVE` event
+2. **SQS Message**: Stream processor sends a message to the cascade deletion queue with `{entityType, entityId}`
+3. **Queue Processing**: Cascade deletion listener receives the message
+4. **Query Relations**: Queries DynamoDB for all `joinRelation` items with `PK: joinRelation#<EntityType>#<entityId>`
+5. **Bulk Delete**: Deletes all related S3 Parquet files using bulk delete operations
+6. **Cleanup**: Removes all `joinRelation` items from DynamoDB
+
+This ensures that when you delete a `User`, all related join table entries (like `user_favorite_products`) and their S3 files are automatically cleaned up.
 
 ## ⚙️ Function Configuration
 
 ### Runtime & Memory Allocation
 
-| **Function Type**   | **Runtime**  | **Memory** | **Timeout** | **Concurrency** |
-| ------------------- | ------------ | ---------- | ----------- | --------------- |
-| CRUD Operations     | Node.js 18.x | 128 MB     | 30 seconds  | 1000            |
-| SQL Queries         | Node.js 18.x | 256 MB     | 5 minutes   | 100             |
-| Task Mutations      | Node.js 18.x | 256 MB     | 30 seconds  | 100             |
-| Task Result Queries | Node.js 18.x | 256 MB     | 30 seconds  | 100             |
-| Execution Tracker   | Node.js 18.x | 256 MB     | 5 minutes   | 100             |
-| Resolvers           | Node.js 18.x | 512 MB     | 5 minutes   | 100             |
-| Stream Processor    | Python 3.11  | 1024 MB    | 5 minutes   | 10              |
+| **Function Type**         | **Runtime**  | **Memory** | **Timeout** | **Concurrency** |
+| ------------------------- | ------------ | ---------- | ----------- | --------------- |
+| CRUD Operations           | Node.js 18.x | 128 MB     | 30 seconds  | 1000            |
+| SQL Queries               | Node.js 18.x | 256 MB     | 5 minutes   | 100             |
+| Task Mutations            | Node.js 18.x | 256 MB     | 30 seconds  | 100             |
+| Task Result Queries       | Node.js 18.x | 256 MB     | 30 seconds  | 100             |
+| Execution Tracker         | Node.js 18.x | 256 MB     | 5 minutes   | 100             |
+| Resolvers                 | Node.js 18.x | 512 MB     | 5 minutes   | 100             |
+| Stream Processor          | Python 3.11  | 1024 MB    | 5 minutes   | 10              |
+| Cascade Deletion Listener | Node.js 18.x | 512 MB     | 5 minutes   | 10              |
 
 ### Environment Variables
 
@@ -1144,6 +1250,7 @@ DYNAMODB_TABLE_NAME={project}
 S3_BUCKET_NAME={project}-{account-id}
 ATHENA_DATABASE_NAME={project}_db
 ATHENA_OUTPUT_LOCATION=s3://{project}-athena-results-{account-id}/query-results/
+CASCADE_DELETION_QUEUE_URL=https://sqs.{region}.amazonaws.com/{account}/{project}-cascade-deletion
 AWS_REGION={region}
 ```
 
@@ -1190,11 +1297,31 @@ AWS_REGION={region}
     "s3:DeleteObject",
     "s3:GetObject",
     "glue:CreateTable",
-    "glue:GetTable"
+    "glue:GetTable",
+    "sqs:SendMessage"
   ],
   "Resource": [
     "arn:aws:s3:::{project}-{account}/*",
-    "arn:aws:glue:{region}:{account}:*"
+    "arn:aws:glue:{region}:{account}:*",
+    "arn:aws:sqs:{region}:{account}:{project}-cascade-deletion"
+  ]
+}
+```
+
+#### Cascade Deletion Listener
+
+```json
+{
+  "Effect": "Allow",
+  "Action": [
+    "dynamodb:Query",
+    "dynamodb:DeleteItem",
+    "s3:DeleteObject",
+    "s3:DeleteObjects"
+  ],
+  "Resource": [
+    "arn:aws:dynamodb:{region}:{account}:table/{project}",
+    "arn:aws:s3:::{project}-{account}/*"
   ]
 }
 ```

@@ -11,7 +11,7 @@ type Query {
 type Mutation {
   addProductToFavorite(userId: ID!, productId: ID!): Product
     @sql_query(
-      query: "INSERT INTO $virtual_table(user_favorite_products) (userId, productId) VALUES ($args.userId, $args.productId)"
+      query: "INSERT INTO $join_table(user_favorite_products) (userId:User, productId:Product) VALUES ($args.userId, $args.productId)"
     )
 }
 

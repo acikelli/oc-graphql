@@ -75,14 +75,14 @@ function validateCustomDirectives(schemaString: string): void {
     }
   }
 
-  // Validate virtual table references
-  const virtualTablePattern = /\$virtual_table\([^)]+\)/g;
-  const virtualTableMatches = schemaString.match(virtualTablePattern) || [];
+  // Validate join table references
+  const joinTablePattern = /\$join_table\([^)]+\)/g;
+  const joinTableMatches = schemaString.match(joinTablePattern) || [];
 
-  for (const match of virtualTableMatches) {
-    const tableName = match.match(/\$virtual_table\(([^)]+)\)/)?.[1];
+  for (const match of joinTableMatches) {
+    const tableName = match.match(/\$join_table\(([^)]+)\)/)?.[1];
     if (!tableName || tableName.trim().length === 0) {
-      throw new Error(`Invalid virtual table reference: ${match}`);
+      throw new Error(`Invalid join table reference: ${match}`);
     }
   }
 }

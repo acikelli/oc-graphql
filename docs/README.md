@@ -20,7 +20,7 @@ Welcome to the comprehensive documentation for **OC-GraphQL** - a powerful CLI t
 
 - **[Data Pipeline](./data-pipeline.md)** - DynamoDB to Parquet processing flow
 - **[Query Performance](./query-performance.md)** - Athena optimization and best practices
-- **[Virtual Tables](./virtual-tables.md)** - Many-to-many relationship handling
+- **[Join Tables](./join-tables.md)** - Many-to-many relationship handling
 
 ### Operations
 

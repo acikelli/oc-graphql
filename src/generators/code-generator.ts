@@ -78,6 +78,10 @@ export class CodeGenerator {
     lambdaFunctions[`ocg-${this.projectName}-stream-processor.py`] =
       this.generateStreamProcessor();
 
+    // Generate cascade deletion queue listener Lambda
+    lambdaFunctions[`ocg-${this.projectName}-cascade-deletion-listener.js`] =
+      this.generateCascadeDeletionListener();
+
     // Generate task functions for queries with @task directive
     for (const query of this.schemaMetadata.queries) {
       if (query.isTask && query.sqlQuery) {
@@ -269,12 +273,13 @@ exports.handler = async (event) => {
 
   private generateSqlQueryFunction(field: FieldMetadata): string {
     const query = field.sqlQuery!.query;
-    const isVirtualTable = query.includes("$virtual_table(");
+    const isJoinTable = query.includes("$join_table(");
 
     return `
 const { AthenaClient, StartQueryExecutionCommand, GetQueryExecutionCommand, GetQueryResultsCommand } = require('@aws-sdk/client-athena');
 const { DynamoDBClient, PutItemCommand } = require('@aws-sdk/client-dynamodb');
 const { marshall } = require('@aws-sdk/util-dynamodb');
+const { v4: uuidv4 } = require('uuid');
 
 const athenaClient = new AthenaClient({ region: process.env.AWS_REGION });
 const dynamoClient = new DynamoDBClient({ region: process.env.AWS_REGION });
@@ -328,10 +333,10 @@ exports.handler = async (event) => {
       });
     }
     
-    ${isVirtualTable ? this.generateVirtualTableLogic() : ""}
+    ${isJoinTable ? this.generateJoinTableLogic() : ""}
     
-    // Replace virtual table references
-    query = query.replace(/\\$virtual_table\\(([^)]+)\\)/g, '$1');
+    // Replace join table references
+    query = query.replace(/\\$join_table\\(([^)]+)\\)/g, '$1');
     
     // Execute Athena query
     const queryExecution = await athenaClient.send(new StartQueryExecutionCommand({
@@ -386,67 +391,129 @@ exports.handler = async (event) => {
 `;
   }
 
-  private generateVirtualTableLogic(): string {
+  private generateJoinTableLogic(): string {
     return `
-    // Handle virtual table insert
-    if (query.includes('INSERT INTO') && query.includes('$virtual_table(')) {
-      const virtualTableMatch = query.match(/\\$virtual_table\\(([^)]+)\\)/);
-      if (virtualTableMatch) {
-        const tableName = virtualTableMatch[1];
+    // Handle join table insert
+    if (query.includes('INSERT INTO') && query.includes('$join_table(')) {
+      const joinTableMatch = query.match(/\\$join_table\\(([^)]+)\\)/);
+      if (joinTableMatch) {
+        const tableName = joinTableMatch[1];
         
-        // Extract column names from INSERT statement
-        const insertMatch = query.match(/INSERT\\s+INTO\\s+\\$virtual_table\\([^)]+\\)\\s*\\(([^)]+)\\)/i);
-        const columnNames = insertMatch ? insertMatch[1].split(',').map(col => col.trim()) : [];
+        // Extract column definitions from INSERT statement (e.g., "userId:User, productId:Product")
+        const insertMatch = query.match(/INSERT\\s+INTO\\s+\\$join_table\\([^)]+\\)\\s*\\(([^)]+)\\)/i);
+        const columnDefs = insertMatch ? insertMatch[1].split(',').map(col => col.trim()) : [];
         
-        console.log(\`Detected columns for virtual table \${tableName}:\`, columnNames);
-        
-        // Dynamically extract field values from arguments
-        const item = {
-          entityType: tableName, // Use actual table name as entity type
-          virtualTable: tableName,
-          createdAt: new Date().toISOString()
-        };
-        
-        // Add all arguments as fields and construct PK/SK dynamically
+        // Parse entity type annotations (e.g., "userId:User" -> {column: "userId", entityType: "User"})
+        const entityMappings = [];
         const argEntries = Object.entries(event.arguments);
-        const pkFields = [];
-        const skFields = [];
+        const relationId = uuidv4();
+        const now = new Date().toISOString();
         
-        // Add all arguments to the item
-        argEntries.forEach(([key, value]) => {
-          item[key] = value;
-          // Use argument values to build composite keys based on detected columns
-          if (key.toLowerCase().includes('id') && columnNames.some(col => col.toLowerCase().includes(key.toLowerCase()))) {
-            if (pkFields.length === 0) {
-              pkFields.push(\`\${key.replace(/Id$/, '').toLowerCase()}#\${value}\`);
-            } else {
-              skFields.push(\`\${key.replace(/Id$/, '').toLowerCase()}#\${value}\`);
+        columnDefs.forEach(colDef => {
+          const parts = colDef.split(':');
+          if (parts.length === 2) {
+            const columnName = parts[0].trim();
+            const entityType = parts[1].trim();
+            const value = event.arguments[columnName];
+            if (value) {
+              entityMappings.push({ column: columnName, entityType, value });
             }
           }
         });
         
-        // Fallback: if no ID fields detected, use first two arguments
-        if (pkFields.length === 0 && argEntries.length >= 2) {
-          const [firstArg, secondArg] = argEntries;
-          pkFields.push(\`\${firstArg[0].replace(/Id$/, '').toLowerCase()}#\${firstArg[1]}\`);
-          skFields.push(\`\${secondArg[0].replace(/Id$/, '').toLowerCase()}#\${secondArg[1]}\`);
+        console.log(\`Detected entity mappings for join table \${tableName}:\`, entityMappings);
+        
+        // Build the join table item
+        const item = {
+          entityType: tableName,
+          joinTable: tableName,
+          createdAt: now
+        };
+        
+        // Add all arguments as fields
+        argEntries.forEach(([key, value]) => {
+          item[key] = value;
+        });
+        
+        // Build PK/SK from first two entity mappings
+        const pkFields = [];
+        const skFields = [];
+        
+        if (entityMappings.length >= 2) {
+          pkFields.push(\`\${entityMappings[0].entityType.toLowerCase()}#\${entityMappings[0].value}\`);
+          skFields.push(\`\${entityMappings[1].entityType.toLowerCase()}#\${entityMappings[1].value}\`);
+        } else if (entityMappings.length === 1) {
+          pkFields.push(\`\${entityMappings[0].entityType.toLowerCase()}#\${entityMappings[0].value}\`);
         }
         
-        // Construct PK and SK from the field values
+        // Construct PK and SK for the join table item
         item.PK = \`relation#\${tableName}#\${pkFields.join('#')}\`;
         item.SK = \`relation#\${tableName}#\${skFields.join('#')}\`;
         
-        console.log(\`Creating virtual table item for \${tableName}:\`, item);
+        // Calculate S3 key (will be written by stream processor)
+        // The stream processor extracts key components by splitting PK/SK by '#' and taking parts[2:]
+        // For PK: relation#tableName#entityType#id -> ['relation', 'tableName', 'entityType', 'id'] -> [2:] = ['entityType', 'id']
+        // For SK: relation#tableName#entityType#id -> ['relation', 'tableName', 'entityType', 'id'] -> [2:] = ['entityType', 'id']
+        // Then joins all with '_': entityType_id_entityType_id
+        const currentDate = new Date();
+        const year = currentDate.getUTCFullYear();
+        const month = String(currentDate.getUTCMonth() + 1).padStart(2, '0');
+        const day = String(currentDate.getUTCDate()).padStart(2, '0');
+        // Extract just the values (entityType and id) from pkFields and skFields, matching stream processor logic
+        const keyComponents = [];
+        pkFields.forEach(field => {
+          const parts = field.split('#');
+          if (parts.length >= 2) {
+            keyComponents.push(parts[0]); // entityType
+            keyComponents.push(parts[1]); // id
+          }
+        });
+        skFields.forEach(field => {
+          const parts = field.split('#');
+          if (parts.length >= 2) {
+            keyComponents.push(parts[0]); // entityType
+            keyComponents.push(parts[1]); // id
+          }
+        });
+        const keyString = keyComponents.join('_');
+        const s3Key = \`tables/\${tableName}/year=\${year}/month=\${month}/day=\${day}/\${keyString}.parquet\`;
         
+        console.log(\`Creating join table item for \${tableName}:\`, item);
+        
+        // Save the join table item
         await dynamoClient.send(new PutItemCommand({
           TableName: TABLE_NAME,
           Item: marshall(item)
         }));
         
+        // Save joinRelation items for each entity type to enable cascade deletion
+        // Use lowercase entity type to match DynamoDB entityType field
+        for (const mapping of entityMappings) {
+          const entityTypeLower = mapping.entityType.toLowerCase();
+          const joinRelationItem = {
+            PK: \`joinRelation#\${entityTypeLower}#\${mapping.value}\`,
+            SK: \`joinRelation#\${relationId}#\${entityTypeLower}#\${mapping.value}\`,
+            entityType: 'joinRelation',
+            relationId: relationId,
+            joinTableName: tableName,
+            relatedEntityType: entityTypeLower,
+            relatedEntityId: mapping.value,
+            s3Key: s3Key,
+            createdAt: now
+          };
+          
+          console.log(\`Creating joinRelation item for \${entityTypeLower}:\`, joinRelationItem);
+          
+          await dynamoClient.send(new PutItemCommand({
+            TableName: TABLE_NAME,
+            Item: marshall(joinRelationItem)
+          }));
+        }
+        
         return item;
       }
     }
-    `;
+`;
   }
 
   private generateResolverFunction(type: TypeMetadata): string {
@@ -636,8 +703,8 @@ async function executeQuery(query, args) {
     
     console.log('Query after parameter replacement:', query);
     
-    // Replace virtual table references
-    query = query.replace(/\$virtual_table\(([^)]+)\)/g, '$1');
+    // Replace join table references
+    query = query.replace(/\$join_table\(([^)]+)\)/g, '$1');
     
     // Execute Athena query
     const queryExecution = await athenaClient.send(new StartQueryExecutionCommand({
@@ -721,9 +788,11 @@ logger.setLevel(logging.INFO)
 # Initialize AWS clients
 s3_client = boto3.client('s3')
 glue_client = boto3.client('glue')
+sqs_client = boto3.client('sqs')
 
 BUCKET_NAME = os.environ['S3_BUCKET_NAME']
 GLUE_DATABASE = os.environ['ATHENA_DATABASE_NAME']
+CASCADE_DELETION_QUEUE_URL = os.environ.get('CASCADE_DELETION_QUEUE_URL')
 
 def lambda_handler(event, context):
     """Main Lambda handler for DynamoDB stream processing"""
@@ -757,7 +826,7 @@ def process_record(record):
         logger.error(f"Error processing stream record: {str(e)}")
 
 def handle_delete_operation(record, current_date, year, month, day):
-    """Handle DELETE operations by removing Parquet files"""
+    """Handle DELETE operations by removing Parquet files and triggering cascade deletion"""
     # Handle DELETE operations
     if 'OldImage' not in record.get('dynamodb', {}):
         return
@@ -769,8 +838,9 @@ def handle_delete_operation(record, current_date, year, month, day):
         return
     
     # Determine S3 key for deletion with date partitioning
-    if item.get('virtualTable'):
-        virtual_table = item['virtualTable']
+    if item.get('joinTable'):
+        # Join table deletion - just delete the S3 file
+        join_table = item['joinTable']
         pk_parts = item['PK'].split('#')
         sk_parts = item['SK'].split('#')
         key_components = pk_parts[2:] + sk_parts[2:]
@@ -780,21 +850,34 @@ def handle_delete_operation(record, current_date, year, month, day):
         item_date = parse_item_date(item.get('createdAt'), current_date)
         item_year, item_month, item_day = format_date_parts(item_date)
         
-        s3_key = f"tables/{virtual_table}/year={item_year}/month={item_month}/day={item_day}/{key_string}.parquet"
+        s3_key = f"tables/{join_table}/year={item_year}/month={item_month}/day={item_day}/{key_string}.parquet"
+        
+        logger.info(f"Deleting join table S3 object: {s3_key}")
+        
+        # Delete from S3
+        try:
+            s3_client.delete_object(Bucket=BUCKET_NAME, Key=s3_key)
+            logger.info(f"Successfully deleted join table S3 object: {s3_key}")
+        except Exception as e:
+            logger.warning(f"S3 object may not exist or already deleted: {s3_key} - {str(e)}")
     else:
+        # Regular entity deletion - delete S3 file and trigger cascade deletion
         item_date = parse_item_date(item.get('createdAt'), current_date)
         item_year, item_month, item_day = format_date_parts(item_date)
         
         s3_key = f"tables/{entity_type}/year={item_year}/month={item_month}/day={item_day}/{item['id']}.parquet"
-    
-    logger.info(f"Deleting S3 object: {s3_key}")
-    
-    # Delete from S3
-    try:
-        s3_client.delete_object(Bucket=BUCKET_NAME, Key=s3_key)
-        logger.info(f"Successfully deleted S3 object: {s3_key}")
-    except Exception as e:
-        logger.warning(f"S3 object may not exist or already deleted: {s3_key} - {str(e)}")
+        
+        logger.info(f"Deleting entity S3 object: {s3_key}")
+        
+        # Delete from S3
+        try:
+            s3_client.delete_object(Bucket=BUCKET_NAME, Key=s3_key)
+            logger.info(f"Successfully deleted entity S3 object: {s3_key}")
+        except Exception as e:
+            logger.warning(f"S3 object may not exist or already deleted: {s3_key} - {str(e)}")
+        
+        # Send message to SQS for cascade deletion of join relations
+        send_cascade_deletion_message(entity_type, item.get('id'))
 
 def handle_insert_update_operation(record, event_name, current_date, year, month, day):
     """Handle INSERT and MODIFY operations by creating/updating Parquet files"""
@@ -816,25 +899,25 @@ def handle_insert_update_operation(record, event_name, current_date, year, month
     item['_partition_month'] = month
     item['_partition_day'] = day
     
-    if item.get('virtualTable'):
-        handle_virtual_table_item(item, year, month, day, event_name)
+    if item.get('joinTable'):
+        handle_join_table_item(item, year, month, day, event_name)
     else:
         handle_regular_entity_item(item, entity_type, year, month, day, event_name)
 
-def handle_virtual_table_item(item, year, month, day, event_name):
-    """Handle virtual table items with date partitioning"""
-    virtual_table = item['virtualTable']
+def handle_join_table_item(item, year, month, day, event_name):
+    """Handle join table items with date partitioning"""
+    join_table = item['joinTable']
     pk_parts = item['PK'].split('#')
     sk_parts = item['SK'].split('#')
     
     key_components = pk_parts[2:] + sk_parts[2:]
     key_string = '_'.join(key_components)
     
-    s3_key = f"tables/{virtual_table}/year={year}/month={month}/day={day}/{key_string}.parquet"
-    table_location = f"s3://{BUCKET_NAME}/tables/{virtual_table}/"
-    athena_table_name = virtual_table
+    s3_key = f"tables/{join_table}/year={year}/month={month}/day={day}/{key_string}.parquet"
+    table_location = f"s3://{BUCKET_NAME}/tables/{join_table}/"
+    athena_table_name = join_table
     
-    logger.info(f"Processing virtual table item for '{virtual_table}' - {event_name}")
+    logger.info(f"Processing join table item for '{join_table}' - {event_name}")
     
     # Convert to DataFrame and write as Parquet
     df = create_dataframe_from_item(item)
@@ -1157,6 +1240,28 @@ def format_date_parts(date_obj):
         date_obj.strftime('%m'),
         date_obj.strftime('%d')
     )
+
+def send_cascade_deletion_message(entity_type, entity_id):
+    """Send message to SQS queue for cascade deletion of join relations"""
+    if not CASCADE_DELETION_QUEUE_URL:
+        logger.warning("CASCADE_DELETION_QUEUE_URL not set, skipping cascade deletion")
+        return
+    
+    try:
+        message = {
+            'entityType': entity_type,
+            'entityId': entity_id,
+            'timestamp': datetime.utcnow().isoformat()
+        }
+        
+        sqs_client.send_message(
+            QueueUrl=CASCADE_DELETION_QUEUE_URL,
+            MessageBody=json.dumps(message)
+        )
+        
+        logger.info(f"Sent cascade deletion message for {entity_type}#{entity_id}")
+    except Exception as e:
+        logger.error(f"Error sending cascade deletion message: {str(e)}")
 `;
     }
   }
@@ -1558,8 +1663,8 @@ exports.handler = async (event) => {
       });
     }
     
-    // Replace virtual table references
-    sqlQuery = sqlQuery.replace(/\\$virtual_table\\(([^)]+)\\)/g, '$1');
+    // Replace join table references
+    sqlQuery = sqlQuery.replace(/\\$join_table\\(([^)]+)\\)/g, '$1');
     
     // Start Athena query execution
     const queryExecution = await athenaClient.send(new StartQueryExecutionCommand({
@@ -1839,6 +1944,116 @@ exports.handler = async (event) => {
     return { statusCode: 200, body: 'Success' };
   } catch (error) {
     console.error('Error tracking Athena execution:', error);
+    throw error;
+  }
+};
+`;
+  }
+
+  private generateCascadeDeletionListener(): string {
+    return `
+const { DynamoDBClient, QueryCommand, DeleteItemCommand } = require('@aws-sdk/client-dynamodb');
+const { S3Client, DeleteObjectsCommand } = require('@aws-sdk/client-s3');
+const { unmarshall } = require('@aws-sdk/util-dynamodb');
+
+const dynamoClient = new DynamoDBClient({ region: process.env.AWS_REGION });
+const s3Client = new S3Client({ region: process.env.AWS_REGION });
+const TABLE_NAME = process.env.DYNAMODB_TABLE_NAME;
+const BUCKET_NAME = process.env.S3_BUCKET_NAME;
+
+exports.handler = async (event) => {
+  try {
+    console.log('Processing cascade deletion messages:', JSON.stringify(event, null, 2));
+    
+    for (const record of event.Records) {
+      try {
+        const messageBody = JSON.parse(record.body);
+        const { entityType, entityId } = messageBody;
+        
+        console.log(\`Processing cascade deletion for \${entityType}#\${entityId}\`);
+        
+        // Query all joinRelation items for this entity
+        const pk = \`joinRelation#\${entityType}#\${entityId}\`;
+        
+        const queryResult = await dynamoClient.send(new QueryCommand({
+          TableName: TABLE_NAME,
+          KeyConditionExpression: 'PK = :pk',
+          ExpressionAttributeValues: {
+            ':pk': { S: pk }
+          }
+        }));
+        
+        if (!queryResult.Items || queryResult.Items.length === 0) {
+          console.log(\`No join relations found for \${entityType}#\${entityId}\`);
+          continue;
+        }
+        
+        console.log(\`Found \${queryResult.Items.length} join relations to delete\`);
+        
+        // Group S3 keys by bucket (for bulk delete)
+        const s3KeysToDelete = [];
+        const joinRelationItems = [];
+        
+        for (const item of queryResult.Items) {
+          const unmarshalled = unmarshall(item);
+          joinRelationItems.push(unmarshalled);
+          
+          if (unmarshalled.s3Key) {
+            s3KeysToDelete.push({ Key: unmarshalled.s3Key });
+          }
+        }
+        
+        // Bulk delete S3 objects (max 1000 per request)
+        if (s3KeysToDelete.length > 0) {
+          const chunks = [];
+          for (let i = 0; i < s3KeysToDelete.length; i += 1000) {
+            chunks.push(s3KeysToDelete.slice(i, i + 1000));
+          }
+          
+          for (const chunk of chunks) {
+            try {
+              await s3Client.send(new DeleteObjectsCommand({
+                Bucket: BUCKET_NAME,
+                Delete: {
+                  Objects: chunk,
+                  Quiet: false
+                }
+              }));
+              console.log(\`Deleted \${chunk.length} S3 objects\`);
+            } catch (error) {
+              console.error(\`Error deleting S3 objects:\`, error);
+              // Continue with other chunks
+            }
+          }
+        }
+        
+        // Delete joinRelation items from DynamoDB
+        for (const item of joinRelationItems) {
+          try {
+            await dynamoClient.send(new DeleteItemCommand({
+              TableName: TABLE_NAME,
+              Key: {
+                PK: { S: item.PK },
+                SK: { S: item.SK }
+              }
+            }));
+            console.log(\`Deleted joinRelation item: \${item.PK}#\${item.SK}\`);
+          } catch (error) {
+            console.error(\`Error deleting joinRelation item:\`, error);
+            // Continue with other items
+          }
+        }
+        
+        console.log(\`Successfully processed cascade deletion for \${entityType}#\${entityId}\`);
+      } catch (error) {
+        console.error('Error processing cascade deletion message:', error);
+        // Continue with other messages
+      }
+    }
+    
+    return { statusCode: 200, body: 'Cascade deletion completed' };
+  } catch (error) {
+    console.error('Error in cascade deletion listener:', error);
     throw error;
   }
 };

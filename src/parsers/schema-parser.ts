@@ -53,7 +53,7 @@ export interface SchemaMetadata {
   queries: FieldMetadata[];
   mutations: FieldMetadata[];
   enums: string[];
-  virtualTables: string[];
+  joinTables: string[];
 }
 
 export class SchemaParser {
@@ -68,22 +68,18 @@ export class SchemaParser {
     const queries: FieldMetadata[] = [];
     const mutations: FieldMetadata[] = [];
     const enums: string[] = [];
-    const virtualTables = new Set<string>();
+    const joinTables = new Set<string>();
 
     for (const definition of this.document.definitions) {
       if (definition.kind === "ObjectTypeDefinition") {
         const typeDef = definition as ObjectTypeDefinitionNode;
 
         if (typeDef.name.value === "Query") {
-          queries.push(
-            ...this.parseFields(typeDef.fields || [], virtualTables)
-          );
+          queries.push(...this.parseFields(typeDef.fields || [], joinTables));
         } else if (typeDef.name.value === "Mutation") {
-          mutations.push(
-            ...this.parseFields(typeDef.fields || [], virtualTables)
-          );
+          mutations.push(...this.parseFields(typeDef.fields || [], joinTables));
         } else {
-          types.push(this.parseType(typeDef, virtualTables));
+          types.push(this.parseType(typeDef, joinTables));
         }
       } else if (definition.kind === "EnumTypeDefinition") {
         const enumDef = definition as EnumTypeDefinitionNode;
@@ -96,21 +92,24 @@ export class SchemaParser {
       queries,
       mutations,
       enums,
-      virtualTables: Array.from(virtualTables),
+      joinTables: Array.from(joinTables),
     };
   }
 
   private parseType(
     typeDef: ObjectTypeDefinitionNode,
-    virtualTables: Set<string>
+    joinTables: Set<string>
   ): TypeMetadata {
     const isResolver = this.hasDirective("resolver", typeDef.directives);
-    const isTaskResponse = this.hasDirective("task_response", typeDef.directives);
+    const isTaskResponse = this.hasDirective(
+      "task_response",
+      typeDef.directives
+    );
     const isPrimitive = this.isPrimitiveType(typeDef.name.value);
 
     return {
       name: typeDef.name.value,
-      fields: this.parseFields(typeDef.fields || [], virtualTables),
+      fields: this.parseFields(typeDef.fields || [], joinTables),
       isResolver,
       isPrimitive,
       isTaskResponse,
@@ -119,7 +118,7 @@ export class SchemaParser {
 
   private parseFields(
     fields: readonly FieldDefinitionNode[],
-    virtualTables: Set<string>
+    joinTables: Set<string>
   ): FieldMetadata[] {
     return fields.map((field) => {
       const fieldType = this.extractFieldType(field.type);
@@ -128,9 +127,9 @@ export class SchemaParser {
       const fieldArguments = this.extractFieldArguments(field.arguments);
       const isTask = this.hasDirective("task", field.directives);
 
-      // Extract virtual tables from SQL queries
+      // Extract join tables from SQL queries
       if (sqlQuery?.query) {
-        this.extractVirtualTablesFromQuery(sqlQuery.query, virtualTables);
+        this.extractJoinTablesFromQuery(sqlQuery.query, joinTables);
       }
 
       return {
@@ -200,15 +199,15 @@ export class SchemaParser {
     };
   }
 
-  private extractVirtualTablesFromQuery(
+  private extractJoinTablesFromQuery(
     query: string,
-    virtualTables: Set<string>
+    joinTables: Set<string>
   ): void {
-    const virtualTableRegex = /\$virtual_table\(([^)]+)\)/g;
+    const joinTableRegex = /\$join_table\(([^)]+)\)/g;
     let match;
 
-    while ((match = virtualTableRegex.exec(query)) !== null) {
-      virtualTables.add(match[1]);
+    while ((match = joinTableRegex.exec(query)) !== null) {
+      joinTables.add(match[1]);
     }
   }
 
@@ -273,4 +272,3 @@ export class SchemaParser {
     return primitiveTypes.includes(typeName);
   }
 }
- 

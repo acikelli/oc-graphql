@@ -125,7 +125,7 @@ s3://{project}-{account-id}/
 │   │   └── year=2024/month=12/day=15/
 │   │       ├── post-111.parquet
 │   │       └── post-222.parquet
-│   └── user_posts/                     # Virtual table (relationships)
+│   └── user_posts/                     # Join table (relationships)
 │       └── year=2024/month=12/day=15/
 │           ├── user_123_post_111.parquet
 │           └── user_456_post_222.parquet
@@ -145,10 +145,10 @@ Examples:
 - tables/product/year=2024/month=12/day=15/product-456.parquet
 ```
 
-##### Virtual Tables (Many-to-Many Relationships)
+##### Join Tables (Many-to-Many Relationships)
 
 ```
-Pattern: tables/{virtualTable}/year={YYYY}/month={MM}/day={DD}/{compositeKey}.parquet
+Pattern: tables/{joinTable}/year={YYYY}/month={MM}/day={DD}/{compositeKey}.parquet
 Examples:
 - tables/user_favorites/year=2024/month=12/day=15/user_123_product_456.parquet
 - tables/post_tags/year=2024/month=12/day=15/post_789_tag_321.parquet

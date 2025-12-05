@@ -9,7 +9,7 @@ OC-GraphQL extends GraphQL with powerful custom directives that enable automatic
 1. **Convention over Configuration**: Automatic CRUD operations for standard entities
 2. **SQL-First Analytics**: Direct SQL queries for complex analytics
 3. **Type Safety**: Full GraphQL type checking and validation
-4. **Scalable Relations**: Virtual tables for many-to-many relationships
+4. **Scalable Relations**: Join tables for many-to-many relationships
 5. **Performance Optimization**: Automatic partitioning and indexing
 
 ## 📋 Custom Directives
@@ -478,30 +478,79 @@ type PostAnalytics @resolver {
 }
 ```
 
-## 🔗 Virtual Tables (Many-to-Many Relationships)
+## 🔗 Join Tables (Many-to-Many Relationships)
 
-Virtual tables handle complex relationships through SQL INSERT operations and automatic table generation.
+Join tables handle complex relationships through SQL INSERT operations and automatic table generation. They support **cascade deletion** - when an entity is deleted, all related join table entries and their S3 files are automatically cleaned up.
 
-### Virtual Table Patterns
+### Entity Type Annotations
+
+When defining join table columns, you must specify the entity type for each column using the `columnName:EntityType` syntax. This enables cascade deletion:
+
+```graphql
+# Syntax: (columnName:EntityType, columnName:EntityType)
+INSERT INTO $join_table(table_name) (userId:User, productId:Product) VALUES ($args.userId, $args.productId)
+```
+
+**How it works:**
+
+- The framework extracts entity types (`User`, `Product`) from the column definitions
+- For each entity type, a `joinRelation` item is saved to DynamoDB with:
+  - `PK: joinRelation#<EntityType>#<entityId>`
+  - `SK: joinRelation#<relationId>#<EntityType>#<entityId>`
+  - `s3Key`: The S3 key of the Parquet file
+- When an entity is deleted, the stream processor sends a message to SQS
+- A queue listener Lambda queries all `joinRelation` items for that entity
+- All related S3 Parquet files are bulk-deleted
+- All `joinRelation` items are cleaned up from DynamoDB
+
+**Example Flow:**
+
+```graphql
+type Mutation {
+  addProductToFavorite(userId: ID!, productId: ID!): Product
+    @sql_query(
+      query: "INSERT INTO $join_table(user_favorite_products) (userId:User, productId:Product) VALUES ($args.userId, $args.productId)"
+    )
+}
+```
+
+When this mutation is called:
+
+1. A join table item is created in DynamoDB
+2. Two `joinRelation` items are created:
+   - `PK: joinRelation#user#<userId>`, `SK: joinRelation#<relationId>#user#<userId>`, `s3Key: tables/user_favorite_products/...`
+   - `PK: joinRelation#product#<productId>`, `SK: joinRelation#<relationId>#product#<productId>`, `s3Key: tables/user_favorite_products/...`
+
+When `User` with `id="123"` is deleted:
+
+1. Stream processor deletes the User's S3 file
+2. Stream processor sends SQS message: `{entityType: "user", entityId: "123"}`
+3. Cascade deletion listener queries: `PK = joinRelation#user#123`
+4. Finds all related join table entries (e.g., `user_favorite_products`)
+5. Bulk deletes all related S3 Parquet files
+6. Deletes all `joinRelation` items from DynamoDB
+
+### Join Table Patterns
 
 #### User Favorites System
 
 ```graphql
 type Mutation {
-  # Creates entries in virtual table "user_favorites"
+  # Creates entries in join table "user_favorites"
+  # Entity type annotations enable cascade deletion
   addToFavorites(userId: ID!, productId: ID!): UserFavorite!
     @sql_query(
-      query: "INSERT INTO $virtual_table(user_favorites) (user_id, product_id, created_at) VALUES ($args.userId, $args.productId, NOW())"
+      query: "INSERT INTO $join_table(user_favorites) (userId:User, productId:Product) VALUES ($args.userId, $args.productId)"
     )
 
   removeFromFavorites(userId: ID!, productId: ID!): Boolean!
     @sql_query(
-      query: "DELETE FROM $virtual_table(user_favorites) WHERE user_id = $args.userId AND product_id = $args.productId"
+      query: "DELETE FROM $join_table(user_favorites) WHERE userId = $args.userId AND productId = $args.productId"
     )
 }
 
 type Query {
-  # Query virtual table data
+  # Query join table data
   getUserFavorites(userId: ID!): [Product!]!
     @sql_query(
       query: """
@@ -520,12 +569,12 @@ type Query {
 type Mutation {
   followUser(followerId: ID!, followingId: ID!): UserFollow!
     @sql_query(
-      query: "INSERT INTO $virtual_table(user_follows) (follower_id, following_id, created_at) VALUES ($args.followerId, $args.followingId, NOW())"
+      query: "INSERT INTO $join_table(user_follows) (followerId:User, followingId:User) VALUES ($args.followerId, $args.followingId)"
     )
 
   unfollowUser(followerId: ID!, followingId: ID!): Boolean!
     @sql_query(
-      query: "DELETE FROM $virtual_table(user_follows) WHERE follower_id = $args.followerId AND following_id = $args.followingId"
+      query: "DELETE FROM $join_table(user_follows) WHERE followerId = $args.followerId AND followingId = $args.followingId"
     )
 }
 
@@ -821,15 +870,15 @@ type Mutation {
   updateUser(id: ID!, input: UpdateUserInput!): User!
   deleteUser(id: ID!): DeleteResult!
 
-  # Virtual table operations
+  # Join table operations
   likePost(userId: ID!, postId: ID!): PostLike!
     @sql_query(
-      query: "INSERT INTO $virtual_table(post_likes) (user_id, post_id, created_at) VALUES ($args.userId, $args.postId, NOW())"
+      query: "INSERT INTO $join_table(post_likes) (userId:User, postId:Post) VALUES ($args.userId, $args.postId)"
     )
 
   unlikePost(userId: ID!, postId: ID!): Boolean!
     @sql_query(
-      query: "DELETE FROM $virtual_table(post_likes) WHERE user_id = $args.userId AND post_id = $args.postId"
+      query: "DELETE FROM $join_table(post_likes) WHERE userId = $args.userId AND postId = $args.postId"
     )
 }
 ```

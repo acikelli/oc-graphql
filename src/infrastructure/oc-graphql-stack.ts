@@ -15,7 +15,11 @@ import * as iam from "aws-cdk-lib/aws-iam";
 import * as glue from "aws-cdk-lib/aws-glue";
 import * as events from "aws-cdk-lib/aws-events";
 import * as targets from "aws-cdk-lib/aws-events-targets";
-import { DynamoEventSource } from "aws-cdk-lib/aws-lambda-event-sources";
+import * as sqs from "aws-cdk-lib/aws-sqs";
+import {
+  DynamoEventSource,
+  SqsEventSource,
+} from "aws-cdk-lib/aws-lambda-event-sources";
 import { SchemaMetadata } from "../parsers/schema-parser";
 import * as path from "path";
 
@@ -198,12 +202,20 @@ export class OcGraphQLStack extends Stack {
     // Create AppSync resolvers
     this.createAppSyncResolvers(api, lambdaFunctions, schemaMetadata);
 
+    // SQS Queue for cascade deletion
+    const cascadeDeletionQueue = new sqs.Queue(this, "CascadeDeletionQueue", {
+      queueName: `${projectName}-cascade-deletion`,
+      visibilityTimeout: Duration.minutes(5),
+      retentionPeriod: Duration.days(14),
+    });
+
     // Environment variables for all functions (same as other Lambda functions)
     const commonEnvironment: Record<string, string> = {
       DYNAMODB_TABLE_NAME: table.tableName,
       S3_BUCKET_NAME: dataBucket.bucketName,
       ATHENA_DATABASE_NAME: glueDatabase.ref,
       ATHENA_OUTPUT_LOCATION: `s3://${athenaResultsBucket.bucketName}/query-results/`,
+      CASCADE_DELETION_QUEUE_URL: cascadeDeletionQueue.queueUrl,
     };
 
     // DynamoDB Stream processor (Python with Parquet support)
@@ -233,6 +245,37 @@ export class OcGraphQLStack extends Stack {
         retryAttempts: 3,
       })
     );
+
+    // Grant stream processor permission to send messages to SQS
+    cascadeDeletionQueue.grantSendMessages(streamProcessor);
+
+    // Cascade deletion queue listener Lambda (always created)
+    const cascadeDeletionListener = new lambda.Function(
+      this,
+      "CascadeDeletionListener",
+      {
+        functionName: `OCG-${projectName}-cascade-deletion-listener`,
+        runtime: lambda.Runtime.NODEJS_18_X,
+        handler: `ocg-${projectName}-cascade-deletion-listener.handler`,
+        code: lambda.Code.fromAsset(generatedCodePath),
+        role: lambdaRole,
+        environment: commonEnvironment,
+        timeout: Duration.minutes(5),
+        memorySize: 512,
+      }
+    );
+
+    // Connect Lambda to SQS queue
+    cascadeDeletionListener.addEventSource(
+      new SqsEventSource(cascadeDeletionQueue, {
+        batchSize: 10,
+        maxBatchingWindow: Duration.seconds(5),
+      })
+    );
+
+    // Grant permissions for DynamoDB and S3
+    table.grantReadWriteData(cascadeDeletionListener);
+    dataBucket.grantDelete(cascadeDeletionListener);
 
     // Create EventBridge Lambda and rule for tracking Athena query executions (if any tasks exist)
     const hasTasks = schemaMetadata.queries.some((q) => q.isTask);
