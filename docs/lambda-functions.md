@@ -1220,11 +1220,30 @@ exports.handler = async (event) => {
 1. **Entity Deletion**: When a regular entity (e.g., `User`) is deleted, the stream processor detects the `REMOVE` event
 2. **SQS Message**: Stream processor sends a message to the cascade deletion queue with `{entityType, entityId}`
 3. **Queue Processing**: Cascade deletion listener receives the message
-4. **Query Relations**: Queries DynamoDB for all `joinRelation` items with `PK: joinRelation#<EntityType>#<entityId>`
-5. **Bulk Delete**: Deletes all related S3 Parquet files using bulk delete operations
-6. **Cleanup**: Removes all `joinRelation` items from DynamoDB
+4. **Query Relations**: Queries DynamoDB for all `joinRelation` items with `PK: joinRelation#<entityType>#<entityId>` and `SK` starting with `joinRelation#`
+5. **GSI1 Query**: For each found `relationId`, queries GSI1 (`GSI1-PK: joinRelation#<relationId>`) to find all related entities
+6. **Bulk Delete**: Deletes all related S3 Parquet files using bulk delete operations
+7. **Cleanup**: Removes all `joinRelation` items from DynamoDB
 
-This ensures that when you delete a `User`, all related join table entries (like `user_favorite_products`) and their S3 files are automatically cleaned up.
+This ensures that when you delete a `User`, all related join table entries (like `user_favorite_products`) and their S3 files are automatically cleaned up, even when multiple entity types are involved in the same join table.
+
+**Join Relation Item Structure:**
+
+```javascript
+{
+  PK: "joinRelation#user#123",
+  SK: "joinRelation#abc-123-def-456",
+  "GSI1-PK": "joinRelation#abc-123-def-456",
+  "GSI1-SK": "joinRelation#user#123",
+  entityType: "joinRelation",
+  relationId: "abc-123-def-456",
+  joinTableName: "user_favorite_products",
+  relatedEntityType: "user",
+  relatedEntityId: "123",
+  s3Key: "tables/user_favorite_products/year=2025/month=12/day=05/abc-123-def-456.parquet",
+  createdAt: "2025-12-05T10:00:00Z"
+}
+```
 
 ## ⚙️ Function Configuration
 

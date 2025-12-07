@@ -55,6 +55,13 @@ export class OcGraphQLStack extends Stack {
       pointInTimeRecovery: true, // Enable for data protection
     });
 
+    // Add GSI1 for join relation queries (GSI1-PK: joinRelation#relationId, GSI1-SK: joinRelation#entityType#entityId)
+    table.addGlobalSecondaryIndex({
+      indexName: "GSI1",
+      partitionKey: { name: "GSI1-PK", type: dynamodb.AttributeType.STRING },
+      sortKey: { name: "GSI1-SK", type: dynamodb.AttributeType.STRING },
+    });
+
     // S3 Bucket for data lake
     const dataBucket = new s3.Bucket(this, "DataBucket", {
       bucketName: `${projectName}-${this.account}`,

@@ -423,76 +423,40 @@ exports.handler = async (event) => {
         
         console.log(\`Detected entity mappings for join table \${tableName}:\`, entityMappings);
         
-        // Build the join table item
-        const item = {
-          entityType: tableName,
-          joinTable: tableName,
+        if (entityMappings.length === 0) {
+          throw new Error('No entity type mappings found in join table insert');
+        }
+        
+        // Calculate S3 key using relationId as filename
+        const currentDate = new Date();
+        const year = currentDate.getUTCFullYear();
+        const month = String(currentDate.getUTCMonth() + 1).padStart(2, '0');
+        const day = String(currentDate.getUTCDate()).padStart(2, '0');
+        const s3Key = \`tables/\${tableName}/year=\${year}/month=\${month}/day=\${day}/\${relationId}.parquet\`;
+        
+        // Build a data item for the Parquet file (contains all entity mappings)
+        const parquetDataItem = {
+          relationId: relationId,
+          joinTableName: tableName,
+          s3Key: s3Key,
           createdAt: now
         };
         
         // Add all arguments as fields
         argEntries.forEach(([key, value]) => {
-          item[key] = value;
+          parquetDataItem[key] = value;
         });
         
-        // Build PK/SK from first two entity mappings
-        const pkFields = [];
-        const skFields = [];
-        
-        if (entityMappings.length >= 2) {
-          pkFields.push(\`\${entityMappings[0].entityType.toLowerCase()}#\${entityMappings[0].value}\`);
-          skFields.push(\`\${entityMappings[1].entityType.toLowerCase()}#\${entityMappings[1].value}\`);
-        } else if (entityMappings.length === 1) {
-          pkFields.push(\`\${entityMappings[0].entityType.toLowerCase()}#\${entityMappings[0].value}\`);
-        }
-        
-        // Construct PK and SK for the join table item
-        item.PK = \`relation#\${tableName}#\${pkFields.join('#')}\`;
-        item.SK = \`relation#\${tableName}#\${skFields.join('#')}\`;
-        
-        // Calculate S3 key (will be written by stream processor)
-        // The stream processor extracts key components by splitting PK/SK by '#' and taking parts[2:]
-        // For PK: relation#tableName#entityType#id -> ['relation', 'tableName', 'entityType', 'id'] -> [2:] = ['entityType', 'id']
-        // For SK: relation#tableName#entityType#id -> ['relation', 'tableName', 'entityType', 'id'] -> [2:] = ['entityType', 'id']
-        // Then joins all with '_': entityType_id_entityType_id
-        const currentDate = new Date();
-        const year = currentDate.getUTCFullYear();
-        const month = String(currentDate.getUTCMonth() + 1).padStart(2, '0');
-        const day = String(currentDate.getUTCDate()).padStart(2, '0');
-        // Extract just the values (entityType and id) from pkFields and skFields, matching stream processor logic
-        const keyComponents = [];
-        pkFields.forEach(field => {
-          const parts = field.split('#');
-          if (parts.length >= 2) {
-            keyComponents.push(parts[0]); // entityType
-            keyComponents.push(parts[1]); // id
-          }
-        });
-        skFields.forEach(field => {
-          const parts = field.split('#');
-          if (parts.length >= 2) {
-            keyComponents.push(parts[0]); // entityType
-            keyComponents.push(parts[1]); // id
-          }
-        });
-        const keyString = keyComponents.join('_');
-        const s3Key = \`tables/\${tableName}/year=\${year}/month=\${month}/day=\${day}/\${keyString}.parquet\`;
-        
-        console.log(\`Creating join table item for \${tableName}:\`, item);
-        
-        // Save the join table item
-        await dynamoClient.send(new PutItemCommand({
-          TableName: TABLE_NAME,
-          Item: marshall(item)
-        }));
-        
-        // Save joinRelation items for each entity type to enable cascade deletion
-        // Use lowercase entity type to match DynamoDB entityType field
+        // Save joinRelation items for each entity type with new structure
+        // PK: joinRelation#entityType#entityId, SK: joinRelation#relationId
+        // GSI1-PK: joinRelation#relationId, GSI1-SK: joinRelation#entityType#entityId
         for (const mapping of entityMappings) {
           const entityTypeLower = mapping.entityType.toLowerCase();
           const joinRelationItem = {
             PK: \`joinRelation#\${entityTypeLower}#\${mapping.value}\`,
-            SK: \`joinRelation#\${relationId}#\${entityTypeLower}#\${mapping.value}\`,
+            SK: \`joinRelation#\${relationId}\`,
+            'GSI1-PK': \`joinRelation#\${relationId}\`,
+            'GSI1-SK': \`joinRelation#\${entityTypeLower}#\${mapping.value}\`,
             entityType: 'joinRelation',
             relationId: relationId,
             joinTableName: tableName,
@@ -510,7 +474,26 @@ exports.handler = async (event) => {
           }));
         }
         
-        return item;
+        // Save the Parquet data item (will be processed by stream processor)
+        // Use a temporary PK/SK that the stream processor will recognize as a join table item
+        const tempItem = {
+          PK: \`joinTableData#\${relationId}\`,
+          SK: \`joinTableData#\${relationId}\`,
+          entityType: tableName,
+          joinTable: tableName,
+          ...parquetDataItem
+        };
+        
+        await dynamoClient.send(new PutItemCommand({
+          TableName: TABLE_NAME,
+          Item: marshall(tempItem)
+        }));
+        
+        // Return the parquet data item (without internal fields)
+        const returnItem = { ...parquetDataItem };
+        delete returnItem.PK;
+        delete returnItem.SK;
+        return returnItem;
       }
     }
 `;
@@ -838,19 +821,65 @@ def handle_delete_operation(record, current_date, year, month, day):
         return
     
     # Determine S3 key for deletion with date partitioning
-    if item.get('joinTable'):
-        # Join table deletion - just delete the S3 file
-        join_table = item['joinTable']
-        pk_parts = item['PK'].split('#')
-        sk_parts = item['SK'].split('#')
-        key_components = pk_parts[2:] + sk_parts[2:]
-        key_string = '_'.join(key_components)
+    if item.get('entityType') == 'joinRelation':
+        # Join relation item deletion - delete the Parquet file and cascade delete related items via GSI1
+        relation_id = item.get('relationId')
+        s3_key = item.get('s3Key')
         
-        # Use original creation date for deletion if available
-        item_date = parse_item_date(item.get('createdAt'), current_date)
-        item_year, item_month, item_day = format_date_parts(item_date)
+        if s3_key:
+            logger.info(f"Deleting join relation S3 object: {s3_key}")
+            try:
+                s3_client.delete_object(Bucket=BUCKET_NAME, Key=s3_key)
+                logger.info(f"Successfully deleted join relation S3 object: {s3_key}")
+            except Exception as e:
+                logger.warning(f"S3 object may not exist or already deleted: {s3_key} - {str(e)}")
         
-        s3_key = f"tables/{join_table}/year={item_year}/month={item_month}/day={item_day}/{key_string}.parquet"
+        # Query GSI1 to find all related joinRelation items for this relationId
+        if relation_id:
+            try:
+                import boto3.dynamodb.conditions as conditions
+                dynamodb_resource = boto3.resource('dynamodb')
+                table = dynamodb_resource.Table(TABLE_NAME)
+                
+                # Query GSI1 to get all items with this relationId
+                response = table.query(
+                    IndexName='GSI1',
+                    KeyConditionExpression=conditions.Key('GSI1-PK').eq(f'joinRelation#{relation_id}')
+                )
+                
+                # Delete all related joinRelation items
+                for related_item in response.get('Items', []):
+                    try:
+                        table.delete_item(
+                            Key={
+                                'PK': related_item['PK'],
+                                'SK': related_item['SK']
+                            }
+                        )
+                        logger.info(f"Deleted related joinRelation item: {related_item['PK']}#{related_item['SK']}")
+                    except Exception as e:
+                        logger.error(f"Error deleting related joinRelation item: {e}")
+            except Exception as e:
+                logger.error(f"Error querying GSI1 for cascade deletion: {e}")
+    elif item.get('joinTable') or item.get('PK', '').startswith('joinTableData#'):
+        # Join table data item or legacy join table - delete S3 file
+        join_table = item.get('joinTableName') or item.get('joinTable')
+        relation_id = item.get('relationId')
+        
+        if relation_id and join_table:
+            # Use relationId as filename
+            item_date = parse_item_date(item.get('createdAt'), current_date)
+            item_year, item_month, item_day = format_date_parts(item_date)
+            s3_key = f"tables/{join_table}/year={item_year}/month={item_month}/day={item_day}/{relation_id}.parquet"
+        else:
+            # Legacy format
+            pk_parts = item['PK'].split('#')
+            sk_parts = item['SK'].split('#')
+            key_components = pk_parts[2:] + sk_parts[2:]
+            key_string = '_'.join(key_components)
+            item_date = parse_item_date(item.get('createdAt'), current_date)
+            item_year, item_month, item_day = format_date_parts(item_date)
+            s3_key = f"tables/{join_table}/year={item_year}/month={item_month}/day={item_day}/{key_string}.parquet"
         
         logger.info(f"Deleting join table S3 object: {s3_key}")
         
@@ -899,13 +928,58 @@ def handle_insert_update_operation(record, event_name, current_date, year, month
     item['_partition_month'] = month
     item['_partition_day'] = day
     
-    if item.get('joinTable'):
-        handle_join_table_item(item, year, month, day, event_name)
+    # Check if this is a join table data item (joinTableData#relationId)
+    if item.get('PK', '').startswith('joinTableData#'):
+        handle_join_table_data_item(item, year, month, day, event_name)
+    elif item.get('joinTable'):
+        # Legacy join table item (should not be created anymore, but handle for backwards compatibility)
+        handle_legacy_join_table_item(item, year, month, day, event_name)
     else:
         handle_regular_entity_item(item, entity_type, year, month, day, event_name)
 
-def handle_join_table_item(item, year, month, day, event_name):
-    """Handle join table items with date partitioning"""
+def handle_join_table_data_item(item, year, month, day, event_name):
+    """Handle join table data items using relationId as filename"""
+    join_table = item.get('joinTableName') or item.get('joinTable')
+    relation_id = item.get('relationId')
+    
+    if not relation_id:
+        logger.warning(f"Join table item missing relationId: {item}")
+        return
+    
+    if not join_table:
+        logger.warning(f"Join table item missing joinTableName: {item}")
+        return
+    
+    s3_key = f"tables/{join_table}/year={year}/month={month}/day={day}/{relation_id}.parquet"
+    table_location = f"s3://{BUCKET_NAME}/tables/{join_table}/"
+    athena_table_name = join_table
+    
+    logger.info(f"Processing join table data item for '{join_table}' with relationId '{relation_id}' - {event_name}")
+    
+    # Convert to DataFrame and write as Parquet
+    df = create_dataframe_from_item(item)
+    write_parquet_to_s3(df, s3_key)
+    
+    # Ensure Glue table exists with Parquet format
+    ensure_optimized_glue_table(athena_table_name, table_location, item, df)
+    
+    # Delete the temporary joinTableData item after processing
+    try:
+        import boto3.dynamodb.conditions as conditions
+        dynamodb_resource = boto3.resource('dynamodb')
+        table = dynamodb_resource.Table(TABLE_NAME)
+        table.delete_item(
+            Key={
+                'PK': item['PK'],
+                'SK': item['SK']
+            }
+        )
+        logger.info(f"Deleted temporary joinTableData item: {item['PK']}")
+    except Exception as e:
+        logger.warning(f"Error deleting temporary joinTableData item: {e}")
+
+def handle_legacy_join_table_item(item, year, month, day, event_name):
+    """Handle legacy join table items (for backwards compatibility)"""
     join_table = item['joinTable']
     pk_parts = item['PK'].split('#')
     sk_parts = item['SK'].split('#')
@@ -917,7 +991,7 @@ def handle_join_table_item(item, year, month, day, event_name):
     table_location = f"s3://{BUCKET_NAME}/tables/{join_table}/"
     athena_table_name = join_table
     
-    logger.info(f"Processing join table item for '{join_table}' - {event_name}")
+    logger.info(f"Processing legacy join table item for '{join_table}' - {event_name}")
     
     # Convert to DataFrame and write as Parquet
     df = create_dataframe_from_item(item)
@@ -1973,13 +2047,15 @@ exports.handler = async (event) => {
         console.log(\`Processing cascade deletion for \${entityType}#\${entityId}\`);
         
         // Query all joinRelation items for this entity
+        // PK: joinRelation#entityType#entityId, SK starts with joinRelation#
         const pk = \`joinRelation#\${entityType}#\${entityId}\`;
         
         const queryResult = await dynamoClient.send(new QueryCommand({
           TableName: TABLE_NAME,
-          KeyConditionExpression: 'PK = :pk',
+          KeyConditionExpression: 'PK = :pk AND begins_with(SK, :skPrefix)',
           ExpressionAttributeValues: {
-            ':pk': { S: pk }
+            ':pk': { S: pk },
+            ':skPrefix': { S: 'joinRelation#' }
           }
         }));
         
@@ -1990,24 +2066,67 @@ exports.handler = async (event) => {
         
         console.log(\`Found \${queryResult.Items.length} join relations to delete\`);
         
-        // Group S3 keys by bucket (for bulk delete)
-        const s3KeysToDelete = [];
+        // Collect unique relationIds and S3 keys
+        const relationIds = new Set();
+        const s3KeysToDelete = new Set();
         const joinRelationItems = [];
         
         for (const item of queryResult.Items) {
           const unmarshalled = unmarshall(item);
           joinRelationItems.push(unmarshalled);
           
+          if (unmarshalled.relationId) {
+            relationIds.add(unmarshalled.relationId);
+          }
+          
           if (unmarshalled.s3Key) {
-            s3KeysToDelete.push({ Key: unmarshalled.s3Key });
+            s3KeysToDelete.add(unmarshalled.s3Key);
+          }
+        }
+        
+        // For each relationId, query GSI1 to find all related joinRelation items
+        const { QueryCommand: GSI1QueryCommand } = require('@aws-sdk/client-dynamodb');
+        
+        for (const relationId of relationIds) {
+          try {
+            // Query GSI1 to get all items with this relationId
+            // Use ExpressionAttributeNames for GSI1-PK since it contains a hyphen
+            const gsi1Result = await dynamoClient.send(new GSI1QueryCommand({
+              TableName: TABLE_NAME,
+              IndexName: 'GSI1',
+              KeyConditionExpression: '#gsi1Pk = :gsi1Pk',
+              ExpressionAttributeNames: {
+                '#gsi1Pk': 'GSI1-PK'
+              },
+              ExpressionAttributeValues: {
+                ':gsi1Pk': { S: \`joinRelation#\${relationId}\` }
+              }
+            }));
+            
+            // Add all related items to deletion list
+            if (gsi1Result.Items) {
+              for (const item of gsi1Result.Items) {
+                const relatedItem = unmarshall(item);
+                if (!joinRelationItems.find(item => item.PK === relatedItem.PK && item.SK === relatedItem.SK)) {
+                  joinRelationItems.push(relatedItem);
+                  if (relatedItem.s3Key) {
+                    s3KeysToDelete.add(relatedItem.s3Key);
+                  }
+                }
+              }
+            }
+          } catch (error) {
+            console.error(\`Error querying GSI1 for relationId \${relationId}:\`, error);
+            // Continue with other relationIds
           }
         }
         
         // Bulk delete S3 objects (max 1000 per request)
-        if (s3KeysToDelete.length > 0) {
+        if (s3KeysToDelete.size > 0) {
+          const s3KeysArray = Array.from(s3KeysToDelete).map(key => ({ Key: key }));
           const chunks = [];
-          for (let i = 0; i < s3KeysToDelete.length; i += 1000) {
-            chunks.push(s3KeysToDelete.slice(i, i + 1000));
+          for (let i = 0; i < s3KeysArray.length; i += 1000) {
+            chunks.push(s3KeysArray.slice(i, i + 1000));
           }
           
           for (const chunk of chunks) {
@@ -2027,7 +2146,7 @@ exports.handler = async (event) => {
           }
         }
         
-        // Delete joinRelation items from DynamoDB
+        // Delete all joinRelation items from DynamoDB
         for (const item of joinRelationItems) {
           try {
             await dynamoClient.send(new DeleteItemCommand({

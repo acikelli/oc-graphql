@@ -493,15 +493,22 @@ INSERT INTO $join_table(table_name) (userId:User, productId:Product) VALUES ($ar
 
 **How it works:**
 
-- The framework extracts entity types (`User`, `Product`) from the column definitions
+- The framework extracts entity types (`User`, `Product`, etc.) from the column definitions
+- A unique `relationId` is generated for each join table insert
 - For each entity type, a `joinRelation` item is saved to DynamoDB with:
-  - `PK: joinRelation#<EntityType>#<entityId>`
-  - `SK: joinRelation#<relationId>#<EntityType>#<entityId>`
-  - `s3Key`: The S3 key of the Parquet file
+  - `PK: joinRelation#<entityType>#<entityId>` (lowercase entity type)
+  - `SK: joinRelation#<relationId>`
+  - `GSI1-PK: joinRelation#<relationId>`
+  - `GSI1-SK: joinRelation#<entityType>#<entityId>`
+  - `s3Key`: The S3 key of the Parquet file (using `relationId` as filename)
+  - `relationId`, `joinTableName`, `relatedEntityType`, `relatedEntityId`, etc.
+- The Parquet file is named using the `relationId` (e.g., `tables/user_favorite_products/year=2025/month=12/day=05/<relationId>.parquet`)
 - When an entity is deleted, the stream processor sends a message to SQS
-- A queue listener Lambda queries all `joinRelation` items for that entity
-- All related S3 Parquet files are bulk-deleted
-- All `joinRelation` items are cleaned up from DynamoDB
+- A queue listener Lambda:
+  1. Queries all `joinRelation` items with `PK: joinRelation#<entityType>#<entityId>` and `SK` starting with `joinRelation#`
+  2. For each found `relationId`, queries GSI1 to find all related entities
+  3. Bulk deletes all related S3 Parquet files
+  4. Deletes all `joinRelation` items from DynamoDB
 
 **Example Flow:**
 
@@ -516,19 +523,43 @@ type Mutation {
 
 When this mutation is called:
 
-1. A join table item is created in DynamoDB
+1. A unique `relationId` is generated (e.g., `"abc-123-def-456"`)
 2. Two `joinRelation` items are created:
-   - `PK: joinRelation#user#<userId>`, `SK: joinRelation#<relationId>#user#<userId>`, `s3Key: tables/user_favorite_products/...`
-   - `PK: joinRelation#product#<productId>`, `SK: joinRelation#<relationId>#product#<productId>`, `s3Key: tables/user_favorite_products/...`
+   - `PK: joinRelation#user#<userId>`, `SK: joinRelation#<relationId>`, `GSI1-PK: joinRelation#<relationId>`, `GSI1-SK: joinRelation#user#<userId>`, `s3Key: tables/user_favorite_products/year=2025/month=12/day=05/<relationId>.parquet`
+   - `PK: joinRelation#product#<productId>`, `SK: joinRelation#<relationId>`, `GSI1-PK: joinRelation#<relationId>`, `GSI1-SK: joinRelation#product#<productId>`, `s3Key: tables/user_favorite_products/year=2025/month=12/day=05/<relationId>.parquet`
+3. A temporary `joinTableData` item is created and processed by the stream processor
+4. The stream processor writes a Parquet file named `<relationId>.parquet` to S3
+5. The temporary `joinTableData` item is deleted after processing
 
 When `User` with `id="123"` is deleted:
 
 1. Stream processor deletes the User's S3 file
 2. Stream processor sends SQS message: `{entityType: "user", entityId: "123"}`
-3. Cascade deletion listener queries: `PK = joinRelation#user#123`
-4. Finds all related join table entries (e.g., `user_favorite_products`)
-5. Bulk deletes all related S3 Parquet files
-6. Deletes all `joinRelation` items from DynamoDB
+3. Cascade deletion listener:
+   - Queries: `PK = joinRelation#user#123 AND SK begins_with joinRelation#`
+   - Finds all `relationId`s for this user
+   - For each `relationId`, queries GSI1 to find all related entities (e.g., products)
+   - Bulk deletes all related S3 Parquet files
+   - Deletes all `joinRelation` items from DynamoDB
+
+**Supporting Multiple Entity Types:**
+
+You can now insert into join tables with more than two entity types:
+
+```graphql
+type Mutation {
+  createProjectAssignment(
+    userId: ID!
+    projectId: ID!
+    roleId: ID!
+  ): ProjectAssignment
+    @sql_query(
+      query: "INSERT INTO $join_table(project_assignments) (userId:User, projectId:Project, roleId:Role) VALUES ($args.userId, $args.projectId, $args.roleId)"
+    )
+}
+```
+
+This creates three `joinRelation` items (one for each entity type) all sharing the same `relationId`, enabling efficient cascade deletion across all related entities.
 
 ### Join Table Patterns
 
