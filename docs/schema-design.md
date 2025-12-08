@@ -494,7 +494,12 @@ INSERT INTO $join_table(table_name) (userId:User, productId:Product) VALUES ($ar
 **How it works:**
 
 - The framework extracts entity types (`User`, `Product`, etc.) from the column definitions
-- A unique `relationId` is generated for each join table insert
+- A **deterministic `relationId`** is generated from the entity mappings (sorted alphabetically by entity type and value, then hashed using SHA-256)
+  - This ensures that duplicate inserts with the same values return the existing relation instead of creating a new one
+  - Format: `entityType1:value1|entityType2:value2|...` (sorted) → SHA-256 hash (first 32 chars)
+- Before creating a new relation, the system checks if `joinTableData#<relationId>` already exists
+  - If it exists, returns the existing data (prevents duplicates)
+  - If it doesn't exist, creates a new relation
 - For each entity type, a `joinRelation` item is saved to DynamoDB with:
   - `PK: joinRelation#<entityType>#<entityId>` (lowercase entity type)
   - `SK: joinRelation#<relationId>`
@@ -503,6 +508,8 @@ INSERT INTO $join_table(table_name) (userId:User, productId:Product) VALUES ($ar
   - `s3Key`: The S3 key of the Parquet file (using `relationId` as filename)
   - `relationId`, `joinTableName`, `relatedEntityType`, `relatedEntityId`, etc.
 - The Parquet file is named using the `relationId` (e.g., `tables/user_favorite_products/year=2025/month=12/day=05/<relationId>.parquet`)
+- A temporary `joinTableData#<relationId>` item is created and processed by the stream processor
+- The stream processor writes the Parquet file to S3 and **automatically deletes** the temporary `joinTableData` item after processing
 - When an entity is deleted, the stream processor sends a message to SQS
 - A queue listener Lambda:
   1. Queries all `joinRelation` items with `PK: joinRelation#<entityType>#<entityId>` and `SK` starting with `joinRelation#`
@@ -523,13 +530,18 @@ type Mutation {
 
 When this mutation is called:
 
-1. A unique `relationId` is generated (e.g., `"abc-123-def-456"`)
-2. Two `joinRelation` items are created:
+1. Entity mappings are extracted: `[{entityType: "User", value: userId}, {entityType: "Product", value: productId}]`
+2. Mappings are sorted alphabetically: `[{entityType: "Product", value: productId}, {entityType: "User", value: userId}]`
+3. A deterministic `relationId` is generated: `SHA-256("product:<productId>|user:<userId>")` → first 32 chars (e.g., `"a1b2c3d4e5f6..."`)
+4. The system checks if `joinTableData#<relationId>` already exists:
+   - **If exists**: Returns the existing relation data (prevents duplicate inserts)
+   - **If not exists**: Proceeds with creating a new relation
+5. Two `joinRelation` items are created:
    - `PK: joinRelation#user#<userId>`, `SK: joinRelation#<relationId>`, `GSI1-PK: joinRelation#<relationId>`, `GSI1-SK: joinRelation#user#<userId>`, `s3Key: tables/user_favorite_products/year=2025/month=12/day=05/<relationId>.parquet`
    - `PK: joinRelation#product#<productId>`, `SK: joinRelation#<relationId>`, `GSI1-PK: joinRelation#<relationId>`, `GSI1-SK: joinRelation#product#<productId>`, `s3Key: tables/user_favorite_products/year=2025/month=12/day=05/<relationId>.parquet`
-3. A temporary `joinTableData` item is created and processed by the stream processor
-4. The stream processor writes a Parquet file named `<relationId>.parquet` to S3
-5. The temporary `joinTableData` item is deleted after processing
+6. A temporary `joinTableData#<relationId>` item is created and processed by the stream processor
+7. The stream processor writes a Parquet file named `<relationId>.parquet` to S3
+8. The stream processor **automatically deletes** the temporary `joinTableData` item after processing
 
 When `User` with `id="123"` is deleted:
 

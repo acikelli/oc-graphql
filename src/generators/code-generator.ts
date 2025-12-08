@@ -277,8 +277,8 @@ exports.handler = async (event) => {
 
     return `
 const { AthenaClient, StartQueryExecutionCommand, GetQueryExecutionCommand, GetQueryResultsCommand } = require('@aws-sdk/client-athena');
-const { DynamoDBClient, PutItemCommand } = require('@aws-sdk/client-dynamodb');
-const { marshall } = require('@aws-sdk/util-dynamodb');
+const { DynamoDBClient, PutItemCommand, GetItemCommand } = require('@aws-sdk/client-dynamodb');
+const { marshall, unmarshall } = require('@aws-sdk/util-dynamodb');
 const { v4: uuidv4 } = require('uuid');
 
 const athenaClient = new AthenaClient({ region: process.env.AWS_REGION });
@@ -406,7 +406,6 @@ exports.handler = async (event) => {
         // Parse entity type annotations (e.g., "userId:User" -> {column: "userId", entityType: "User"})
         const entityMappings = [];
         const argEntries = Object.entries(event.arguments);
-        const relationId = uuidv4();
         const now = new Date().toISOString();
         
         columnDefs.forEach(colDef => {
@@ -425,6 +424,49 @@ exports.handler = async (event) => {
         
         if (entityMappings.length === 0) {
           throw new Error('No entity type mappings found in join table insert');
+        }
+        
+        // Create deterministic relationId from sorted entity mappings
+        // Sort by entityType first, then by value to ensure consistency
+        const sortedMappings = [...entityMappings].sort((a, b) => {
+          const typeCompare = a.entityType.localeCompare(b.entityType);
+          if (typeCompare !== 0) return typeCompare;
+          return a.value.localeCompare(b.value);
+        });
+        
+        // Create deterministic ID: entityType1:value1|entityType2:value2|...
+        const relationIdParts = sortedMappings.map(m => \`\${m.entityType.toLowerCase()}:\${m.value}\`);
+        const relationIdString = relationIdParts.join('|');
+        
+        // Use crypto to create a deterministic hash (SHA-256, then take first 32 chars)
+        const crypto = require('crypto');
+        const relationId = crypto.createHash('sha256').update(relationIdString).digest('hex').substring(0, 32);
+        
+        console.log(\`Generated deterministic relationId: \${relationId} from: \${relationIdString}\`);
+        
+        // Check if this relation already exists
+        const existingItemKey = {
+          PK: { S: \`joinTableData#\${relationId}\` },
+          SK: { S: \`joinTableData#\${relationId}\` }
+        };
+        
+        const existingItem = await dynamoClient.send(new GetItemCommand({
+          TableName: TABLE_NAME,
+          Key: existingItemKey
+        }));
+        
+        if (existingItem.Item) {
+          // Relation already exists, return existing data
+          const existingData = unmarshall(existingItem.Item);
+          console.log(\`Relation \${relationId} already exists, returning existing data\`);
+          
+          // Return existing data (without internal DynamoDB fields)
+          const returnItem = { ...existingData };
+          delete returnItem.PK;
+          delete returnItem.SK;
+          delete returnItem.entityType;
+          delete returnItem.joinTable;
+          return returnItem;
         }
         
         // Calculate S3 key using relationId as filename
@@ -484,10 +526,36 @@ exports.handler = async (event) => {
           ...parquetDataItem
         };
         
-        await dynamoClient.send(new PutItemCommand({
-          TableName: TABLE_NAME,
-          Item: marshall(tempItem)
-        }));
+        // Use conditional put to prevent race conditions (only insert if doesn't exist)
+        try {
+          await dynamoClient.send(new PutItemCommand({
+            TableName: TABLE_NAME,
+            Item: marshall(tempItem),
+            ConditionExpression: 'attribute_not_exists(PK)'
+          }));
+          
+          console.log(\`Created new join table relation: \${relationId}\`);
+        } catch (error) {
+          // If item already exists (race condition), fetch and return existing data
+          if (error.name === 'ConditionalCheckFailedException') {
+            console.log(\`Relation \${relationId} was created concurrently, fetching existing data\`);
+            const existingItem = await dynamoClient.send(new GetItemCommand({
+              TableName: TABLE_NAME,
+              Key: existingItemKey
+            }));
+            
+            if (existingItem.Item) {
+              const existingData = unmarshall(existingItem.Item);
+              const returnItem = { ...existingData };
+              delete returnItem.PK;
+              delete returnItem.SK;
+              delete returnItem.entityType;
+              delete returnItem.joinTable;
+              return returnItem;
+            }
+          }
+          throw error;
+        }
         
         // Return the parquet data item (without internal fields)
         const returnItem = { ...parquetDataItem };
@@ -820,73 +888,35 @@ def handle_delete_operation(record, current_date, year, month, day):
     if not entity_type:
         return
     
-    # Determine S3 key for deletion with date partitioning
+    # Skip temporary joinTableData items - they are cleaned up after processing and shouldn't trigger S3 deletion
+    if item.get('PK', '').startswith('joinTableData#'):
+        logger.info(f"Skipping deletion of temporary joinTableData item: {item.get('PK')}")
+        return
+    
+    # Skip joinRelation items - they are metadata items and their deletion is handled by cascade deletion
+    # Processing them here would cause infinite loops (deleting joinRelation items creates new DELETE events)
     if item.get('entityType') == 'joinRelation':
-        # Join relation item deletion - delete the Parquet file and cascade delete related items via GSI1
-        relation_id = item.get('relationId')
-        s3_key = item.get('s3Key')
+        logger.info(f"Skipping deletion of joinRelation metadata item: {item.get('PK')}")
+        return
+    
+    # Determine S3 key for deletion with date partitioning
+    if item.get('joinTable'):
+        # Legacy join table item - delete S3 file
+        join_table = item['joinTable']
+        pk_parts = item['PK'].split('#')
+        sk_parts = item['SK'].split('#')
+        key_components = pk_parts[2:] + sk_parts[2:]
+        key_string = '_'.join(key_components)
+        item_date = parse_item_date(item.get('createdAt'), current_date)
+        item_year, item_month, item_day = format_date_parts(item_date)
+        s3_key = f"tables/{join_table}/year={item_year}/month={item_month}/day={item_day}/{key_string}.parquet"
         
-        if s3_key:
-            logger.info(f"Deleting join relation S3 object: {s3_key}")
-            try:
-                s3_client.delete_object(Bucket=BUCKET_NAME, Key=s3_key)
-                logger.info(f"Successfully deleted join relation S3 object: {s3_key}")
-            except Exception as e:
-                logger.warning(f"S3 object may not exist or already deleted: {s3_key} - {str(e)}")
-        
-        # Query GSI1 to find all related joinRelation items for this relationId
-        if relation_id:
-            try:
-                import boto3.dynamodb.conditions as conditions
-                dynamodb_resource = boto3.resource('dynamodb')
-                table = dynamodb_resource.Table(TABLE_NAME)
-                
-                # Query GSI1 to get all items with this relationId
-                response = table.query(
-                    IndexName='GSI1',
-                    KeyConditionExpression=conditions.Key('GSI1-PK').eq(f'joinRelation#{relation_id}')
-                )
-                
-                # Delete all related joinRelation items
-                for related_item in response.get('Items', []):
-                    try:
-                        table.delete_item(
-                            Key={
-                                'PK': related_item['PK'],
-                                'SK': related_item['SK']
-                            }
-                        )
-                        logger.info(f"Deleted related joinRelation item: {related_item['PK']}#{related_item['SK']}")
-                    except Exception as e:
-                        logger.error(f"Error deleting related joinRelation item: {e}")
-            except Exception as e:
-                logger.error(f"Error querying GSI1 for cascade deletion: {e}")
-    elif item.get('joinTable') or item.get('PK', '').startswith('joinTableData#'):
-        # Join table data item or legacy join table - delete S3 file
-        join_table = item.get('joinTableName') or item.get('joinTable')
-        relation_id = item.get('relationId')
-        
-        if relation_id and join_table:
-            # Use relationId as filename
-            item_date = parse_item_date(item.get('createdAt'), current_date)
-            item_year, item_month, item_day = format_date_parts(item_date)
-            s3_key = f"tables/{join_table}/year={item_year}/month={item_month}/day={item_day}/{relation_id}.parquet"
-        else:
-            # Legacy format
-            pk_parts = item['PK'].split('#')
-            sk_parts = item['SK'].split('#')
-            key_components = pk_parts[2:] + sk_parts[2:]
-            key_string = '_'.join(key_components)
-            item_date = parse_item_date(item.get('createdAt'), current_date)
-            item_year, item_month, item_day = format_date_parts(item_date)
-            s3_key = f"tables/{join_table}/year={item_year}/month={item_month}/day={item_day}/{key_string}.parquet"
-        
-        logger.info(f"Deleting join table S3 object: {s3_key}")
+        logger.info(f"Deleting legacy join table S3 object: {s3_key}")
         
         # Delete from S3
         try:
             s3_client.delete_object(Bucket=BUCKET_NAME, Key=s3_key)
-            logger.info(f"Successfully deleted join table S3 object: {s3_key}")
+            logger.info(f"Successfully deleted legacy join table S3 object: {s3_key}")
         except Exception as e:
             logger.warning(f"S3 object may not exist or already deleted: {s3_key} - {str(e)}")
     else:
@@ -964,19 +994,28 @@ def handle_join_table_data_item(item, year, month, day, event_name):
     ensure_optimized_glue_table(athena_table_name, table_location, item, df)
     
     # Delete the temporary joinTableData item after processing
+    # This must happen synchronously to ensure cleanup
     try:
         import boto3.dynamodb.conditions as conditions
         dynamodb_resource = boto3.resource('dynamodb')
         table = dynamodb_resource.Table(TABLE_NAME)
+        # Use conditional delete to ensure we only delete if the item still exists
+        # This prevents duplicate processing if the item was already deleted
         table.delete_item(
             Key={
                 'PK': item['PK'],
                 'SK': item['SK']
-            }
+            },
+            ConditionExpression='attribute_exists(PK)'
         )
-        logger.info(f"Deleted temporary joinTableData item: {item['PK']}")
+        logger.info(f"Successfully deleted temporary joinTableData item: {item['PK']}")
+    except dynamodb_resource.meta.client.exceptions.ConditionalCheckFailedException:
+        # Item was already deleted, skip silently (this is expected in race conditions)
+        logger.info(f"joinTableData item {item['PK']} was already deleted, skipping")
     except Exception as e:
-        logger.warning(f"Error deleting temporary joinTableData item: {e}")
+        # Log error but don't fail - the Parquet file is already written
+        logger.error(f"Error deleting temporary joinTableData item {item['PK']}: {e}")
+        # Don't raise - allow processing to continue
 
 def handle_legacy_join_table_item(item, year, month, day, event_name):
     """Handle legacy join table items (for backwards compatibility)"""
@@ -1148,13 +1187,17 @@ def write_parquet_to_s3(df, s3_key):
 def ensure_optimized_glue_table(table_name, location, sample_item, df):
     """Create or update Glue table with Parquet format support"""
     try:
-        # Check if table exists
+        # Check if table exists (this is a lightweight Glue API call, not S3)
         glue_client.get_table(DatabaseName=GLUE_DATABASE, Name=table_name)
         logger.info(f"Table '{table_name}' already exists")
         return
     except glue_client.exceptions.EntityNotFoundException:
         logger.info(f"Creating new Parquet table: {table_name}")
         create_parquet_glue_table(table_name, location, sample_item, df)
+    except Exception as e:
+        # Log error but don't fail - table might be created concurrently
+        logger.warning(f"Error checking/creating Glue table '{table_name}': {e}")
+        # Don't raise - allow processing to continue
 
 def create_parquet_glue_table(table_name, location, sample_item, df):
     """Create optimized Parquet Glue table using processed DataFrame types"""
@@ -2160,6 +2203,23 @@ exports.handler = async (event) => {
           } catch (error) {
             console.error(\`Error deleting joinRelation item:\`, error);
             // Continue with other items
+          }
+        }
+        
+        // Delete all joinTableData items for the collected relationIds
+        for (const relationId of relationIds) {
+          try {
+            await dynamoClient.send(new DeleteItemCommand({
+              TableName: TABLE_NAME,
+              Key: {
+                PK: { S: \`joinTableData#\${relationId}\` },
+                SK: { S: \`joinTableData#\${relationId}\` }
+              }
+            }));
+            console.log(\`Deleted joinTableData item: joinTableData#\${relationId}\`);
+          } catch (error) {
+            // Item might not exist (already deleted or never created), log but continue
+            console.log(\`joinTableData item joinTableData#\${relationId} not found or already deleted\`);
           }
         }
         
