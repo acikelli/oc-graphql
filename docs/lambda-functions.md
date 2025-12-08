@@ -1139,6 +1139,10 @@ def format_date_parts(date_obj):
 
 SQS queue listener that automatically cleans up join table relations and S3 files when entities are deleted.
 
+### 10. Deletion Listener (Node.js 18.x)
+
+Processes deletion tasks for DELETE SQL operations. Retrieves query results from Athena and deletes S3 Parquet files.
+
 ```javascript
 // Pattern: OCG-{project}-cascade-deletion-listener
 // Example: OCG-blog-cascade-deletion-listener
@@ -1215,6 +1219,135 @@ exports.handler = async (event) => {
 - **Automatic Cleanup**: Removes both S3 Parquet files and DynamoDB joinRelation items
 - **Error Resilience**: Continues processing even if individual deletions fail
 
+### 10. Deletion Listener (Node.js 18.x)
+
+Processes deletion tasks for DELETE SQL operations. Retrieves query results from Athena and performs complete cleanup of both DynamoDB items and S3 Parquet files.
+
+```javascript
+// Pattern: OCG-{project}-deletion-listener
+// Example: OCG-blog-deletion-listener
+
+const {
+  AthenaClient,
+  GetQueryResultsCommand,
+} = require("@aws-sdk/client-athena");
+const { S3Client, DeleteObjectsCommand } = require("@aws-sdk/client-s3");
+const {
+  DynamoDBClient,
+  QueryCommand,
+  DeleteItemCommand,
+} = require("@aws-sdk/client-dynamodb");
+
+const athenaClient = new AthenaClient({ region: process.env.AWS_REGION });
+const s3Client = new S3Client({ region: process.env.AWS_REGION });
+const dynamoClient = new DynamoDBClient({ region: process.env.AWS_REGION });
+const BUCKET_NAME = process.env.S3_BUCKET_NAME;
+const TABLE_NAME = process.env.DYNAMODB_TABLE_NAME;
+
+exports.handler = async (event) => {
+  // Process SQS messages from deletion queue
+  for (const record of event.Records) {
+    const { executionId } = JSON.parse(record.body);
+
+    // Get query results from Athena (contains both s3Key and relationId)
+    const result = await athenaClient.send(
+      new GetQueryResultsCommand({
+        QueryExecutionId: executionId,
+        MaxResults: 1000,
+      })
+    );
+
+    // Extract s3Key and relationId values from results
+    const deletionItems = []; // Array of { s3Key, relationId }
+    const rows = result.ResultSet?.Rows || [];
+    if (rows.length > 0) {
+      const headers = rows[0].Data?.map((col) => col.VarCharValue) || [];
+      const s3KeyIndex = headers.findIndex(
+        (h) => h && h.toLowerCase() === "s3key"
+      );
+      const relationIdIndex = headers.findIndex(
+        (h) => h && h.toLowerCase() === "relationid"
+      );
+
+      for (let i = 1; i < rows.length; i++) {
+        const s3KeyValue = rows[i].Data?.[s3KeyIndex]?.VarCharValue;
+        const relationIdValue = rows[i].Data?.[relationIdIndex]?.VarCharValue;
+        if (s3KeyValue && relationIdValue) {
+          deletionItems.push({ s3Key: s3KeyValue, relationId: relationIdValue });
+        }
+      }
+    }
+
+    // Process each deletion item
+    for (const item of deletionItems) {
+      // 1. Delete joinTableData#{relationId} item
+      await dynamoClient.send(
+        new DeleteItemCommand({
+          TableName: TABLE_NAME,
+          Key: {
+            PK: { S: \`joinTableData#\${item.relationId}\` },
+            SK: { S: \`joinTableData#\${item.relationId}\` },
+          },
+        })
+      );
+
+      // 2. Query GSI1 to find all joinRelation items for this relationId
+      const gsi1Result = await dynamoClient.send(
+        new QueryCommand({
+          TableName: TABLE_NAME,
+          IndexName: "GSI1",
+          KeyConditionExpression: "#gsi1Pk = :gsi1Pk",
+          ExpressionAttributeNames: {
+            "#gsi1Pk": "GSI1-PK",
+          },
+          ExpressionAttributeValues: {
+            ":gsi1Pk": { S: \`joinRelation#\${item.relationId}\` },
+          },
+        })
+      );
+
+      // 3. Delete all joinRelation items found
+      if (gsi1Result.Items && gsi1Result.Items.length > 0) {
+        for (const joinRelationItem of gsi1Result.Items) {
+          const pk = joinRelationItem.PK?.S;
+          const sk = joinRelationItem.SK?.S;
+          if (pk && sk) {
+            await dynamoClient.send(
+              new DeleteItemCommand({
+                TableName: TABLE_NAME,
+                Key: {
+                  PK: { S: pk },
+                  SK: { S: sk },
+                },
+              })
+            );
+          }
+        }
+      }
+
+      // 4. Delete S3 Parquet file
+      await s3Client.send(
+        new DeleteObjectsCommand({
+          Bucket: BUCKET_NAME,
+          Delete: {
+            Objects: [{ Key: item.s3Key }],
+            Quiet: false,
+          },
+        })
+      );
+    }
+  }
+};
+```
+
+**Key Features:**
+
+- **SQS Integration**: Listens to deletion queue for completed DELETE task executions
+- **Athena Results**: Retrieves query results containing both `s3Key` and `relationId` values
+- **Complete Cleanup**: Deletes both DynamoDB items (`joinTableData` and `joinRelation`) and S3 Parquet files
+- **GSI1 Query**: Uses GSI1 to efficiently find all `joinRelation` items for each `relationId`
+- **Error Resilience**: Continues processing even if individual deletions fail
+
 **How Cascade Deletion Works:**
 
 1. **Entity Deletion**: When a regular entity (e.g., `User`) is deleted, the stream processor detects the `REMOVE` event
@@ -1245,6 +1378,38 @@ This ensures that when you delete a `User`, all related join table entries (like
 - This happens synchronously after writing the Parquet file to S3
 - Uses conditional delete to prevent race conditions
 - If deletion fails, it's logged but doesn't block processing (the Parquet file is already written)
+
+**DELETE SQL Operations:**
+
+The framework supports DELETE SQL operations through asynchronous deletion tasks:
+
+1. **Query Transformation**: DELETE queries are automatically transformed to SELECT queries that return both `s3Key` and `relationId` values
+   - Example: `DELETE ufp FROM user_favorite_products ufp ...` → `SELECT ufp.s3Key, ufp.relationId FROM user_favorite_products ufp ...`
+2. **Task Creation**: A task entity is created with `taskType: "deletionTask"`
+3. **Async Execution**: The SELECT query is executed via Athena
+4. **EventBridge Tracking**: Execution tracker monitors query status
+5. **Queue Publishing**: When query succeeds, execution ID is published to deletion queue
+6. **Complete Deletion**: Deletion listener retrieves results from Athena and performs complete cleanup:
+   - Deletes `joinTableData#{relationId}` items from DynamoDB
+   - Queries GSI1 (`GSI1-PK: joinRelation#{relationId}`) to find all `joinRelation` items
+   - Deletes all `joinRelation` items from DynamoDB
+   - Deletes S3 Parquet files
+
+**Example DELETE Mutation:**
+
+```graphql
+type Mutation {
+  removeBrandFromFavorites(brandId: ID!): Boolean
+    @sql_query(
+      query: "DELETE ufp FROM user_favorite_products ufp INNER JOIN products p ON ufp.productId = p.productId WHERE p.brandId = $args.brandId;"
+    )
+}
+```
+
+This automatically generates:
+
+- `triggerTaskRemoveBrandFromFavorites(brandId: ID!): TaskTriggerResult!`
+- `taskResultRemoveBrandFromFavorites(taskId: ID!): DeletionTaskResult!`
 
 **Join Relation Item Structure:**
 
@@ -1278,6 +1443,7 @@ This ensures that when you delete a `User`, all related join table entries (like
 | Resolvers                 | Node.js 18.x | 512 MB     | 5 minutes   | 100             |
 | Stream Processor          | Python 3.11  | 1024 MB    | 5 minutes   | 10              |
 | Cascade Deletion Listener | Node.js 18.x | 512 MB     | 5 minutes   | 10              |
+| Deletion Listener         | Node.js 18.x | 512 MB     | 5 minutes   | 10              |
 
 ### Environment Variables
 
@@ -1360,6 +1526,26 @@ AWS_REGION={region}
   "Resource": [
     "arn:aws:dynamodb:{region}:{account}:table/{project}",
     "arn:aws:s3:::{project}-{account}/*"
+  ]
+}
+```
+
+#### Deletion Listener
+
+```json
+{
+  "Effect": "Allow",
+  "Action": [
+    "dynamodb:Query",
+    "dynamodb:DeleteItem",
+    "athena:GetQueryResults",
+    "s3:DeleteObject",
+    "s3:DeleteObjects"
+  ],
+  "Resource": [
+    "arn:aws:dynamodb:{region}:{account}:table/{project}",
+    "arn:aws:s3:::{project}-{account}/*",
+    "arn:aws:athena:{region}:{account}:*"
   ]
 }
 ```

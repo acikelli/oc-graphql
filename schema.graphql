@@ -9,9 +9,13 @@ type Query {
 }
 
 type Mutation {
-  addProductToFavorite(userId: ID!, productId: ID!): Product
+  addProductToFavorite(userId: ID!, productId: ID!)
     @sql_query(
       query: "INSERT INTO $join_table(user_favorite_products) (userId:User, productId:Product) VALUES ($args.userId, $args.productId)"
+    )
+  removeBrandFromFavorites(productId: ID!)
+    @sql_query(
+      query: "DELETE ufp FROM user_favorite_products ufp WHERE ufp.productId = $args.productId;"
     )
 }
 
@@ -49,9 +53,17 @@ type Address {
   updatedAt: AWSDateTime!
 }
 
+type Brand {
+  id: ID!
+  name: String!
+  createdAt: AWSDateTime!
+  updatedAt: AWSDateTime!
+}
+
 type Product {
   id: ID!
   name: String!
+  brandId: ID!
   price: Float!
   createdAt: AWSDateTime!
   updatedAt: AWSDateTime!

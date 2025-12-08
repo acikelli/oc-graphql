@@ -46,9 +46,23 @@ export class CodeGenerator {
 
     for (const mutation of this.schemaMetadata.mutations) {
       if (mutation.sqlQuery) {
-        lambdaFunctions[
-          `ocg-${this.projectName}-mutation-${mutation.name}.js`
-        ] = this.generateSqlQueryFunction(mutation);
+        const query = mutation.sqlQuery.query.trim().toUpperCase();
+        const isDeleteQuery = query.startsWith("DELETE");
+
+        if (isDeleteQuery) {
+          // Generate task mutation and result query for DELETE operations
+          lambdaFunctions[
+            `ocg-${this.projectName}-mutation-triggerTask${this.capitalizeFirst(mutation.name)}.js`
+          ] = this.generateTriggerDeletionTaskMutation(mutation);
+
+          lambdaFunctions[
+            `ocg-${this.projectName}-query-taskResult${this.capitalizeFirst(mutation.name)}.js`
+          ] = this.generateDeletionTaskResultQuery(mutation);
+        } else {
+          lambdaFunctions[
+            `ocg-${this.projectName}-mutation-${mutation.name}.js`
+          ] = this.generateSqlQueryFunction(mutation);
+        }
       }
     }
 
@@ -81,6 +95,16 @@ export class CodeGenerator {
     // Generate cascade deletion queue listener Lambda
     lambdaFunctions[`ocg-${this.projectName}-cascade-deletion-listener.js`] =
       this.generateCascadeDeletionListener();
+
+    // Generate deletion queue listener Lambda (for DELETE SQL operations)
+    const hasDeleteMutations = this.schemaMetadata.mutations.some((m) => {
+      const query = m.sqlQuery?.query.trim().toUpperCase() || "";
+      return query.startsWith("DELETE");
+    });
+    if (hasDeleteMutations) {
+      lambdaFunctions[`ocg-${this.projectName}-deletion-listener.js`] =
+        this.generateDeletionListener();
+    }
 
     // Generate task functions for queries with @task directive
     for (const query of this.schemaMetadata.queries) {
@@ -371,6 +395,12 @@ exports.handler = async (event) => {
       QueryExecutionId: queryExecutionId
     }));
     
+    // For INSERT operations, return Boolean
+    const queryUpper = query.trim().toUpperCase();
+    if (queryUpper.startsWith("INSERT")) {
+      return true;
+    }
+    
     // Process results
     const rows = results.ResultSet?.Rows || [];
     const headers = rows[0]?.Data?.map(col => col.VarCharValue) || [];
@@ -456,17 +486,9 @@ exports.handler = async (event) => {
         }));
         
         if (existingItem.Item) {
-          // Relation already exists, return existing data
-          const existingData = unmarshall(existingItem.Item);
-          console.log(\`Relation \${relationId} already exists, returning existing data\`);
-          
-          // Return existing data (without internal DynamoDB fields)
-          const returnItem = { ...existingData };
-          delete returnItem.PK;
-          delete returnItem.SK;
-          delete returnItem.entityType;
-          delete returnItem.joinTable;
-          return returnItem;
+          // Relation already exists, return Boolean (success) for INSERT operations
+          console.log(\`Relation \${relationId} already exists, returning success\`);
+          return true;
         }
         
         // Calculate S3 key using relationId as filename
@@ -545,23 +567,15 @@ exports.handler = async (event) => {
             }));
             
             if (existingItem.Item) {
-              const existingData = unmarshall(existingItem.Item);
-              const returnItem = { ...existingData };
-              delete returnItem.PK;
-              delete returnItem.SK;
-              delete returnItem.entityType;
-              delete returnItem.joinTable;
-              return returnItem;
+              // For INSERT operations, return Boolean (success)
+              return true;
             }
           }
           throw error;
         }
         
-        // Return the parquet data item (without internal fields)
-        const returnItem = { ...parquetDataItem };
-        delete returnItem.PK;
-        delete returnItem.SK;
-        return returnItem;
+        // For INSERT operations, return Boolean (success)
+        return true;
       }
     }
 `;
@@ -1591,7 +1605,12 @@ def send_cascade_deletion_message(entity_type, entity_id):
       .join("\n");
 
     // Generate custom mutations with their arguments
+    // Exclude DELETE mutations - they are handled as triggerTask mutations
     const customMutations = this.schemaMetadata.mutations
+      .filter((m) => {
+        const query = m.sqlQuery?.query.trim().toUpperCase() || "";
+        return !query.startsWith("DELETE");
+      })
       .map((m) => {
         const args = m.arguments
           ? m.arguments
@@ -1603,9 +1622,19 @@ def send_cascade_deletion_message(entity_type, entity_id):
               .join(", ")
           : "";
         const argsString = args ? `(${args})` : "";
-        const returnType = m.isList ? `[${m.type}!]` : m.type;
-        const required = m.isRequired ? "!" : "";
-        return `  ${m.name}${argsString}: ${returnType}${required}`;
+
+        // Automatically set return type for INSERT operations
+        const query = m.sqlQuery?.query.trim().toUpperCase() || "";
+        let returnType: string;
+        if (query.startsWith("INSERT")) {
+          returnType = "Boolean!";
+        } else {
+          returnType = m.isList ? `[${m.type}!]` : m.type;
+          const required = m.isRequired ? "!" : "";
+          returnType += required;
+        }
+
+        return `  ${m.name}${argsString}: ${returnType}`;
       })
       .join("\n");
 
@@ -1636,17 +1665,50 @@ def send_cascade_deletion_message(entity_type, entity_id):
       })
       .join("\n");
 
+    // Generate deletion task mutations and result queries for DELETE mutations
+    const deletionTaskMutations = this.schemaMetadata.mutations
+      .filter((m) => {
+        const query = m.sqlQuery?.query.trim().toUpperCase() || "";
+        return query.startsWith("DELETE");
+      })
+      .map((m) => {
+        const args = m.arguments
+          ? m.arguments
+              .map((arg) => {
+                const argType = arg.isList ? `[${arg.type}!]` : arg.type;
+                const required = arg.isRequired ? "!" : "";
+                return `${arg.name}: ${argType}${required}`;
+              })
+              .join(", ")
+          : "";
+        const argsString = args ? `(${args})` : "";
+        return `  triggerTask${this.capitalizeFirst(m.name)}${argsString}: TaskTriggerResult!`;
+      })
+      .join("\n");
+
+    const deletionTaskResultQueries = this.schemaMetadata.mutations
+      .filter((m) => {
+        const query = m.sqlQuery?.query.trim().toUpperCase() || "";
+        return query.startsWith("DELETE");
+      })
+      .map((m) => {
+        return `  taskResult${this.capitalizeFirst(m.name)}(taskId: ID!): DeletionTaskResult!`;
+      })
+      .join("\n");
+
     return `
 type Query {
 ${crudQueries}
 ${customQueries}
 ${taskResultQueries}
+${deletionTaskResultQueries}
 }
 
 type Mutation {
 ${crudMutations}
 ${customMutations}
 ${taskMutations}
+${deletionTaskMutations}
 }
 
 type DeleteResult {
@@ -1663,6 +1725,13 @@ enum TaskStatus {
   SUCCEEDED
   FAILED
 }
+
+type DeletionTaskResult {
+  taskStatus: TaskStatus!
+  startDate: AWSDateTime!
+  finishDate: AWSDateTime
+}
+
 ${this.schemaMetadata.queries
   .filter((q) => q.isTask && q.sqlQuery)
   .map((q) => {
@@ -1698,6 +1767,236 @@ type TaskResult${this.capitalizeFirst(q.name)} {
 
   private capitalizeFirst(str: string): string {
     return str.charAt(0).toUpperCase() + str.slice(1);
+  }
+
+  /**
+   * Transform DELETE query to SELECT s3Key and relationId query
+   * Example: "DELETE ufp FROM user_favorite_products ufp INNER JOIN products p ON ufp.productId = p.productId WHERE p.brandId = $args.brandId;"
+   * Becomes: "SELECT ufp.s3Key, ufp.relationId FROM user_favorite_products ufp INNER JOIN products p ON ufp.productId = p.productId WHERE p.brandId = $args.brandId;"
+   */
+  private transformDeleteToSelectS3Key(deleteQuery: string): string {
+    // Remove trailing semicolon if present
+    let query = deleteQuery.trim().replace(/;\s*$/, "");
+
+    // Match DELETE pattern: DELETE [table_alias] FROM table_name [alias] ...
+    // or DELETE FROM table_name [alias] ...
+    const deletePattern = /^DELETE\s+(?:\w+\s+)?FROM\s+/i;
+
+    if (!deletePattern.test(query)) {
+      throw new Error("Invalid DELETE query format");
+    }
+
+    // Extract the table alias (if present after DELETE)
+    // DELETE ufp FROM ... -> ufp
+    // DELETE FROM ... -> need to find alias from FROM clause
+    const deleteMatch = query.match(/^DELETE\s+(\w+)?\s+FROM\s+/i);
+    const tableAlias = deleteMatch && deleteMatch[1] ? deleteMatch[1] : null;
+
+    // Remove DELETE [alias] FROM part
+    query = query.replace(/^DELETE\s+(?:\w+\s+)?FROM\s+/i, "");
+
+    // Find the first table name/alias after FROM
+    // This handles: table_name alias or just table_name
+    const fromMatch = query.match(/^(\w+)(?:\s+(\w+))?/);
+    const actualAlias =
+      tableAlias || (fromMatch && fromMatch[2]) || (fromMatch && fromMatch[1]);
+
+    if (!actualAlias) {
+      throw new Error("Could not determine table alias for DELETE query");
+    }
+
+    // Transform to SELECT s3Key and relationId query
+    const selectQuery = `SELECT ${actualAlias}.s3Key, ${actualAlias}.relationId FROM ${query}`;
+
+    return selectQuery;
+  }
+
+  private generateTriggerDeletionTaskMutation(mutation: FieldMetadata): string {
+    const mutationName = mutation.name;
+    const capitalizedMutationName = this.capitalizeFirst(mutationName);
+    const originalQuery = mutation.sqlQuery!.query;
+    const selectQuery = this.transformDeleteToSelectS3Key(originalQuery);
+
+    // Build arguments string
+    const argsString = mutation.arguments
+      ? mutation.arguments
+          .map((arg) => {
+            const argType = arg.isList ? `[${arg.type}!]` : arg.type;
+            const required = arg.isRequired ? "!" : "";
+            return `${arg.name}: ${argType}${required}`;
+          })
+          .join(", ")
+      : "";
+
+    return `
+const { AthenaClient, StartQueryExecutionCommand } = require('@aws-sdk/client-athena');
+const { DynamoDBClient, PutItemCommand } = require('@aws-sdk/client-dynamodb');
+const { marshall } = require('@aws-sdk/util-dynamodb');
+
+const athenaClient = new AthenaClient({ region: process.env.AWS_REGION });
+const dynamoClient = new DynamoDBClient({ region: process.env.AWS_REGION });
+const DATABASE_NAME = process.env.ATHENA_DATABASE_NAME;
+const S3_OUTPUT_LOCATION = process.env.ATHENA_OUTPUT_LOCATION;
+const TABLE_NAME = process.env.DYNAMODB_TABLE_NAME;
+
+// SQL injection prevention function
+function escapeSqlValue(value) {
+  if (value === null || value === undefined) {
+    return 'NULL';
+  } else if (typeof value === 'number') {
+    if (!isFinite(value)) {
+      throw new Error('Invalid number value');
+    }
+    return value.toString();
+  } else if (typeof value === 'boolean') {
+    return value ? 'true' : 'false';
+  } else if (typeof value === 'string') {
+    let escaped = value.split("'").join("''");
+    return "'" + escaped + "'";
+  } else {
+    throw new Error('Unsupported data type for SQL parameter');
+  }
+}
+
+exports.handler = async (event) => {
+  try {
+    console.log('Deletion task mutation event:', JSON.stringify(event, null, 2));
+    const now = new Date().toISOString();
+    
+    // Transform DELETE query to SELECT s3Key query
+    let sqlQuery = \`${selectQuery.replace(/\$/g, "\\$")}\`;
+    console.log('Transformed SELECT query:', sqlQuery);
+    
+    // Replace parameter placeholders
+    if (event.arguments) {
+      Object.entries(event.arguments).forEach(([key, value]) => {
+        const argsPattern = '$args.' + key;
+        const sqlSafeValue = escapeSqlValue(value);
+        sqlQuery = sqlQuery.split(argsPattern).join(sqlSafeValue);
+      });
+    }
+    
+    console.log('Final SQL query:', sqlQuery);
+    
+    // Start Athena query execution
+    const queryExecution = await athenaClient.send(new StartQueryExecutionCommand({
+      QueryString: sqlQuery,
+      QueryExecutionContext: {
+        Database: DATABASE_NAME
+      },
+      ResultConfiguration: {
+        OutputLocation: S3_OUTPUT_LOCATION
+      },
+      ClientRequestToken: 'deletion-task-' + Date.now() + '-' + Math.random().toString(36).substring(7)
+    }));
+    
+    console.log('Athena query execution response:', JSON.stringify(queryExecution, null, 2));
+    
+    const executionId = queryExecution.QueryExecutionId;
+    
+    if (!executionId) {
+      console.error('QueryExecutionId is missing from Athena response:', queryExecution);
+      throw new Error('Failed to start Athena query execution: QueryExecutionId is missing');
+    }
+    
+    // Save task entity with taskType: "deletionTask"
+    const taskItem = {
+      PK: \`task#\${executionId}\`,
+      SK: \`task#\${executionId}\`,
+      entityType: 'task',
+      taskId: executionId,
+      taskType: 'deletionTask',
+      mutationName: '${mutationName}',
+      taskStatus: 'RUNNING',
+      startDate: now,
+      finishDate: null,
+      createdAt: now,
+      updatedAt: now
+    };
+    
+    await dynamoClient.send(new PutItemCommand({
+      TableName: TABLE_NAME,
+      Item: marshall(taskItem)
+    }));
+    
+    return { taskId: executionId };
+  } catch (error) {
+    console.error('Error triggering deletion task:', error);
+    throw error;
+  }
+};
+`;
+  }
+
+  private generateDeletionTaskResultQuery(mutation: FieldMetadata): string {
+    const mutationName = mutation.name;
+    const capitalizedMutationName = this.capitalizeFirst(mutationName);
+
+    return `
+const { DynamoDBClient, GetItemCommand } = require('@aws-sdk/client-dynamodb');
+const { AthenaClient, GetQueryExecutionCommand } = require('@aws-sdk/client-athena');
+const { unmarshall } = require('@aws-sdk/util-dynamodb');
+
+const dynamoClient = new DynamoDBClient({ region: process.env.AWS_REGION });
+const athenaClient = new AthenaClient({ region: process.env.AWS_REGION });
+const TABLE_NAME = process.env.DYNAMODB_TABLE_NAME;
+
+exports.handler = async (event) => {
+  try {
+    const taskId = event.arguments.taskId;
+    
+    // Get task entity
+    const taskResult = await dynamoClient.send(new GetItemCommand({
+      TableName: TABLE_NAME,
+      Key: {
+        PK: { S: \`task#\${taskId}\` },
+        SK: { S: \`task#\${taskId}\` }
+      }
+    }));
+    
+    if (!taskResult.Item) {
+      throw new Error('Task not found');
+    }
+    
+    const task = unmarshall(taskResult.Item);
+    
+    // Check execution status
+    let taskStatus = 'RUNNING';
+    let finishDate = null;
+    
+    try {
+      const execResult = await athenaClient.send(new GetQueryExecutionCommand({
+        QueryExecutionId: taskId
+      }));
+      
+      const athenaStatus = execResult.QueryExecution?.Status?.State || 'UNKNOWN';
+      const statusChangeDateTime = execResult.QueryExecution?.Status?.StateChangeDateTime;
+      
+      if (athenaStatus === 'RUNNING' || athenaStatus === 'QUEUED') {
+        taskStatus = 'RUNNING';
+      } else if (athenaStatus === 'SUCCEEDED') {
+        taskStatus = 'SUCCEEDED';
+        finishDate = statusChangeDateTime || new Date().toISOString();
+      } else if (athenaStatus === 'FAILED' || athenaStatus === 'CANCELLED') {
+        taskStatus = 'FAILED';
+        finishDate = statusChangeDateTime || new Date().toISOString();
+      }
+    } catch (error) {
+      console.error(\`Error checking execution \${taskId}:\`, error);
+      taskStatus = 'FAILED';
+    }
+    
+    return {
+      taskStatus: taskStatus,
+      startDate: task.startDate,
+      finishDate: finishDate
+    };
+  } catch (error) {
+    console.error('Error getting deletion task result:', error);
+    throw error;
+  }
+};
+`;
   }
 
   private countSqlQueriesInQuery(query: FieldMetadata): number {
@@ -1796,6 +2095,10 @@ exports.handler = async (event) => {
     
     // Use execution ID as task ID (only one query per task)
     const taskId = queryExecution.QueryExecutionId;
+    
+    if (!taskId) {
+      throw new Error('Failed to start Athena query execution: QueryExecutionId is missing');
+    }
     
     // Create task entity
     const taskItem = {
@@ -2038,6 +2341,10 @@ exports.handler = async (event) => {
       finishDate = new Date().toISOString();
     }
     
+    // Reuse taskResult from earlier (already fetched at line 2301)
+    const task = unmarshall(taskResult.Item);
+    const taskType = task.taskType || null;
+    
     // Update task entity
     const updateExpression = 'SET taskStatus = :status, finishDate = :finishDate, updatedAt = :updatedAt';
     const expressionAttributeValues = {
@@ -2057,6 +2364,28 @@ exports.handler = async (event) => {
     }));
     
     console.log(\`Successfully updated task \${executionId} with status \${taskStatus}\`);
+    
+    // If this is a deletion task that succeeded, publish to deletion queue
+    if (taskType === 'deletionTask' && taskStatus === 'SUCCEEDED') {
+      const { SQSClient, SendMessageCommand } = require('@aws-sdk/client-sqs');
+      const sqsClient = new SQSClient({ region: process.env.AWS_REGION });
+      const DELETION_QUEUE_URL = process.env.DELETION_QUEUE_URL;
+      
+      if (DELETION_QUEUE_URL) {
+        try {
+          await sqsClient.send(new SendMessageCommand({
+            QueueUrl: DELETION_QUEUE_URL,
+            MessageBody: JSON.stringify({ executionId })
+          }));
+          console.log(\`Published deletion task \${executionId} to deletion queue\`);
+        } catch (error) {
+          console.error(\`Error publishing deletion task to queue:\`, error);
+          // Don't fail - task is already updated
+        }
+      } else {
+        console.warn('DELETION_QUEUE_URL not set, skipping queue publish');
+      }
+    }
     
     return { statusCode: 200, body: 'Success' };
   } catch (error) {
@@ -2233,6 +2562,158 @@ exports.handler = async (event) => {
     return { statusCode: 200, body: 'Cascade deletion completed' };
   } catch (error) {
     console.error('Error in cascade deletion listener:', error);
+    throw error;
+  }
+};
+`;
+  }
+
+  private generateDeletionListener(): string {
+    return `
+const { AthenaClient, GetQueryResultsCommand } = require('@aws-sdk/client-athena');
+const { S3Client, DeleteObjectsCommand } = require('@aws-sdk/client-s3');
+const { DynamoDBClient, QueryCommand, DeleteItemCommand } = require('@aws-sdk/client-dynamodb');
+
+const athenaClient = new AthenaClient({ region: process.env.AWS_REGION });
+const s3Client = new S3Client({ region: process.env.AWS_REGION });
+const dynamoClient = new DynamoDBClient({ region: process.env.AWS_REGION });
+const BUCKET_NAME = process.env.S3_BUCKET_NAME;
+const TABLE_NAME = process.env.DYNAMODB_TABLE_NAME;
+
+exports.handler = async (event) => {
+  try {
+    console.log('Processing deletion messages:', JSON.stringify(event, null, 2));
+    
+    for (const record of event.Records) {
+      try {
+        const messageBody = JSON.parse(record.body);
+        const { executionId } = messageBody;
+        
+        console.log(\`Processing deletion for execution \${executionId}\`);
+        
+        // Get query results from Athena
+        let nextToken = null;
+        const deletionItems = []; // Array of { s3Key, relationId }
+        
+        do {
+          const resultParams = {
+            QueryExecutionId: executionId,
+            MaxResults: 1000
+          };
+          
+          if (nextToken) {
+            resultParams.NextToken = nextToken;
+          }
+          
+          const result = await athenaClient.send(new GetQueryResultsCommand(resultParams));
+          
+          // Parse results - first row is headers
+          const rows = result.ResultSet?.Rows || [];
+          if (rows.length > 0) {
+            // Get column indices for s3Key and relationId
+            const headers = rows[0].Data?.map(col => col.VarCharValue) || [];
+            const s3KeyIndex = headers.findIndex(h => h && h.toLowerCase() === 's3key');
+            const relationIdIndex = headers.findIndex(h => h && h.toLowerCase() === 'relationid');
+            
+            if (s3KeyIndex === -1) {
+              throw new Error('s3Key column not found in query results');
+            }
+            
+            if (relationIdIndex === -1) {
+              throw new Error('relationId column not found in query results');
+            }
+            
+            // Extract s3Key and relationId values from data rows
+            for (let i = 1; i < rows.length; i++) {
+              const row = rows[i];
+              const s3KeyValue = row.Data?.[s3KeyIndex]?.VarCharValue;
+              const relationIdValue = row.Data?.[relationIdIndex]?.VarCharValue;
+              
+              if (s3KeyValue && relationIdValue) {
+                deletionItems.push({ s3Key: s3KeyValue, relationId: relationIdValue });
+              }
+            }
+          }
+          
+          nextToken = result.NextToken;
+        } while (nextToken);
+        
+        console.log(\`Found \${deletionItems.length} items to delete\`);
+        
+        // Process each deletion item
+        for (const item of deletionItems) {
+          try {
+            // 1. Delete joinTableData#{relationId} item
+            console.log(\`Deleting joinTableData#\${item.relationId}\`);
+            await dynamoClient.send(new DeleteItemCommand({
+              TableName: TABLE_NAME,
+              Key: {
+                PK: { S: \`joinTableData#\${item.relationId}\` },
+                SK: { S: \`joinTableData#\${item.relationId}\` }
+              }
+            }));
+            
+            // 2. Query GSI1 to find all joinRelation items for this relationId
+            // GSI1-PK: joinRelation#{relationId}
+            const gsi1QueryResult = await dynamoClient.send(new QueryCommand({
+              TableName: TABLE_NAME,
+              IndexName: 'GSI1',
+              KeyConditionExpression: '#gsi1Pk = :gsi1Pk',
+              ExpressionAttributeNames: {
+                '#gsi1Pk': 'GSI1-PK'
+              },
+              ExpressionAttributeValues: {
+                ':gsi1Pk': { S: \`joinRelation#\${item.relationId}\` }
+              }
+            }));
+            
+            // 3. Delete all joinRelation items found
+            if (gsi1QueryResult.Items && gsi1QueryResult.Items.length > 0) {
+              console.log(\`Found \${gsi1QueryResult.Items.length} joinRelation items to delete for relationId \${item.relationId}\`);
+              
+              for (const joinRelationItem of gsi1QueryResult.Items) {
+                const pk = joinRelationItem.PK?.S;
+                const sk = joinRelationItem.SK?.S;
+                
+                if (pk && sk) {
+                  await dynamoClient.send(new DeleteItemCommand({
+                    TableName: TABLE_NAME,
+                    Key: {
+                      PK: { S: pk },
+                      SK: { S: sk }
+                    }
+                  }));
+                }
+              }
+            }
+            
+            // 4. Delete S3 Parquet file
+            console.log(\`Deleting S3 object: \${item.s3Key}\`);
+            await s3Client.send(new DeleteObjectsCommand({
+              Bucket: BUCKET_NAME,
+              Delete: {
+                Objects: [{ Key: item.s3Key }],
+                Quiet: false
+              }
+            }));
+            
+            console.log(\`Successfully deleted item with relationId \${item.relationId}\`);
+          } catch (error) {
+            console.error(\`Error deleting item with relationId \${item.relationId}:\`, error);
+            // Continue with other items
+          }
+        }
+        
+        console.log(\`Successfully processed deletion for execution \${executionId}\`);
+      } catch (error) {
+        console.error('Error processing deletion message:', error);
+        // Continue with other messages
+      }
+    }
+    
+    return { statusCode: 200, body: 'Deletion processing completed' };
+  } catch (error) {
+    console.error('Error in deletion listener:', error);
     throw error;
   }
 };

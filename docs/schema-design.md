@@ -22,6 +22,50 @@ Execute SQL queries directly within GraphQL resolvers.
 directive @sql_query(query: String!) on FIELD_DEFINITION
 ```
 
+#### Automatic Return Type Generation
+
+OC-GraphQL automatically infers and assigns return types for mutations based on the SQL operation type. **You don't need to specify return types for INSERT and DELETE mutations** - they are automatically inferred from the SQL query:
+
+- **INSERT operations**: Automatically return `Boolean!` (returns `true` on success)
+- **DELETE operations**: Automatically generate `triggerTask` mutations that return `TaskTriggerResult!` with `taskId`
+
+**Example Schema (without return types):**
+
+```graphql
+type Mutation {
+  # INSERT mutation - return type automatically set to Boolean!
+  addProductToFavorite(userId: ID!, productId: ID!)
+    @sql_query(
+      query: "INSERT INTO $join_table(user_favorite_products) (userId:User, productId:Product) VALUES ($args.userId, $args.productId)"
+    )
+
+  # DELETE mutation - automatically generates triggerTask mutation
+  removeBrandFromFavorites(brandId: ID!)
+    @sql_query(
+      query: "DELETE ufp FROM user_favorite_products ufp INNER JOIN products p ON ufp.productId = p.productId WHERE p.brandId = $args.brandId"
+    )
+}
+```
+
+**Generated Schema (with automatic return types):**
+
+```graphql
+type Mutation {
+  # INSERT mutation with automatic Boolean! return type
+  addProductToFavorite(userId: ID!, productId: ID!): Boolean!
+
+  # DELETE mutation replaced with triggerTask mutation
+  triggerTaskRemoveBrandFromFavorites(brandId: ID!): TaskTriggerResult!
+}
+
+type Query {
+  # DELETE mutation also generates a task result query
+  taskResultRemoveBrandFromFavorites(taskId: ID!): DeletionTaskResult!
+}
+```
+
+**Note:** The return types are automatically added during schema processing. You can omit them in your schema definition for INSERT and DELETE mutations - OC-GraphQL will add them automatically based on the SQL operation type.
+
 #### Usage Examples
 
 ##### Basic Entity Queries
@@ -292,6 +336,199 @@ This ensures reliable task tracking even without EventBridge configuration.
 4. **Error Handling**: Check `taskStatus` for `FAILED` and handle errors appropriately
 5. **Result Nullability**: The `result` field is nullable - check `taskStatus` before accessing results
 
+### 4. DELETE SQL Operations - Asynchronous Deletion Tasks
+
+Since Athena doesn't support DELETE operations directly, DELETE SQL statements are automatically transformed into SELECT queries that return `s3Key` values, then processed asynchronously as deletion tasks.
+
+#### How DELETE Operations Work
+
+When you define a mutation with a DELETE SQL query:
+
+1. **Automatic Transformation**: The DELETE query is transformed to a SELECT query that returns both `s3Key` and `relationId` values
+2. **Task Creation**: A task entity is created with `taskType: "deletionTask"`
+3. **Async Execution**: The SELECT query is executed via Athena
+4. **Queue Processing**: When the query succeeds, the execution ID is published to a deletion queue
+5. **Complete Deletion**: A deletion listener Lambda processes the queue, retrieves results from Athena, and performs complete cleanup:
+   - Deletes `joinTableData#{relationId}` items from DynamoDB
+   - Queries GSI1 to find all `joinRelation` items for each `relationId`
+   - Deletes all `joinRelation` items from DynamoDB
+   - Deletes S3 Parquet files
+
+#### DELETE Query Format
+
+DELETE queries must follow this format:
+
+```sql
+DELETE [table_alias] FROM table_name [alias] [JOIN clauses] [WHERE clause];
+```
+
+**Examples:**
+
+```graphql
+type Mutation {
+  # Delete join table entries based on related entity
+  # Return type automatically inferred - generates triggerTask mutation
+  removeBrandFromFavorites(brandId: ID!)
+    @sql_query(
+      query: "DELETE ufp FROM user_favorite_products ufp INNER JOIN products p ON ufp.productId = p.productId WHERE p.brandId = $args.brandId;"
+    )
+
+  # Delete entries from a specific table
+  # Return type automatically inferred - generates triggerTask mutation
+  removeExpiredSessions
+    @sql_query(
+      query: "DELETE s FROM sessions s WHERE s.expiresAt < CURRENT_TIMESTAMP;"
+    )
+}
+```
+
+#### Automatic Query Transformation
+
+The framework automatically transforms DELETE queries:
+
+**Original DELETE Query:**
+
+```sql
+DELETE ufp FROM user_favorite_products ufp
+INNER JOIN products p ON ufp.productId = p.productId
+WHERE p.brandId = $args.brandId;
+```
+
+**Transformed SELECT Query:**
+
+```sql
+SELECT ufp.s3Key, ufp.relationId FROM user_favorite_products ufp
+INNER JOIN products p ON ufp.productId = p.productId
+WHERE p.brandId = $args.brandId;
+```
+
+The table alias (e.g., `ufp`) is automatically detected and used to select both the `s3Key` and `relationId` columns.
+
+#### Generated GraphQL Operations
+
+For each DELETE mutation, the framework automatically generates:
+
+1. **Trigger Mutation**: `triggerTask<MutationName>`
+
+   - Takes the same arguments as the original mutation
+   - Returns `{ taskId: ID! }`
+   - Creates a task entity with `taskType: "deletionTask"`
+
+2. **Result Query**: `taskResult<MutationName>`
+   - Takes `taskId: ID!` as argument
+   - Returns `DeletionTaskResult` with:
+     - `taskStatus: TaskStatus!` (RUNNING, SUCCEEDED, FAILED)
+     - `startDate: AWSDateTime!`
+     - `finishDate: AWSDateTime`
+
+**Example:**
+
+```graphql
+# Original mutation
+type Mutation {
+  removeBrandFromFavorites(brandId: ID!): Boolean
+    @sql_query(
+      query: "DELETE ufp FROM user_favorite_products ufp INNER JOIN products p ON ufp.productId = p.productId WHERE p.brandId = $args.brandId;"
+    )
+}
+
+# Automatically generated operations
+type Mutation {
+  triggerTaskRemoveBrandFromFavorites(brandId: ID!): TaskTriggerResult!
+}
+
+type Query {
+  taskResultRemoveBrandFromFavorites(taskId: ID!): DeletionTaskResult!
+}
+
+type DeletionTaskResult {
+  taskStatus: TaskStatus!
+  startDate: AWSDateTime!
+  finishDate: AWSDateTime
+}
+```
+
+#### Usage Flow
+
+```graphql
+# 1. Trigger the deletion task
+mutation {
+  triggerTaskRemoveBrandFromFavorites(brandId: "brand-123") {
+    taskId
+  }
+}
+
+# 2. Poll for completion (repeat until taskStatus is SUCCEEDED or FAILED)
+query {
+  taskResultRemoveBrandFromFavorites(taskId: "abc-123-def-456") {
+    taskStatus
+    startDate
+    finishDate
+  }
+}
+```
+
+#### Complete Deletion Process
+
+When a DELETE task completes successfully, the deletion listener performs complete cleanup:
+
+1. **Retrieves Results**: Gets both `s3Key` and `relationId` from Athena query results
+2. **Deletes Temporary Data**: Removes `joinTableData#{relationId}` items from DynamoDB
+3. **Finds Related Items**: Queries GSI1 (`GSI1-PK: joinRelation#{relationId}`) to find all `joinRelation` items
+4. **Deletes Relations**: Removes all `joinRelation` items from DynamoDB
+5. **Deletes Files**: Removes S3 Parquet files
+
+This ensures complete cleanup of both DynamoDB metadata and S3 data files when DELETE operations are executed.
+
+#### Deletion Task Entity Structure
+
+Deletion tasks are stored in DynamoDB with:
+
+```javascript
+{
+  PK: "task#<executionId>",
+  SK: "task#<executionId>",
+  id: "<executionId>",
+  entityType: "task",
+  taskId: "<executionId>",
+  taskType: "deletionTask", // Identifies this as a deletion task
+  mutationName: "removeBrandFromFavorites",
+  taskStatus: "RUNNING", // RUNNING, SUCCEEDED, FAILED
+  startDate: "2024-01-15T10:00:00Z",
+  finishDate: null,
+  createdAt: "2024-01-15T10:00:00Z",
+  updatedAt: "2024-01-15T10:00:00Z"
+}
+```
+
+#### Deletion Processing Flow
+
+1. **Task Creation**: `triggerTask` mutation creates task entity and starts Athena query
+2. **Query Execution**: Athena executes the transformed SELECT query
+3. **EventBridge Tracking**: Execution tracker monitors query status via EventBridge
+4. **Queue Publishing**: When query succeeds, execution ID is published to deletion queue
+5. **S3 Deletion**: Deletion listener Lambda:
+   - Retrieves query results from Athena
+   - Extracts `s3Key` values from results
+   - Bulk deletes S3 Parquet files (up to 1000 per request)
+   - Logs completion
+
+#### Important Notes
+
+- **Table Alias Required**: DELETE queries must use table aliases (e.g., `DELETE ufp FROM ...`)
+- **s3Key Column**: The target table must have an `s3Key` column (automatically added for join tables)
+- **Asynchronous**: Deletion is asynchronous - use `taskResult` query to track progress
+- **S3 Only**: DELETE operations only remove S3 Parquet files, not DynamoDB items (use cascade deletion for that)
+- **Error Handling**: Check `taskStatus` for `FAILED` and handle errors appropriately
+
+#### Best Practices
+
+1. **Use for Bulk Deletions**: DELETE operations are best for bulk deletions based on complex conditions
+2. **Join Table Deletions**: Perfect for removing join table entries based on related entity properties
+3. **Polling Strategy**: Implement exponential backoff when polling `taskResult` queries
+4. **Error Handling**: Always check `taskStatus` before assuming deletion completed
+5. **Cascade Deletion**: For entity deletions with related data, use cascade deletion instead
+
 ```graphql
 # Good: Long-running analytics query with @task_response type
 type Query {
@@ -521,12 +758,15 @@ INSERT INTO $join_table(table_name) (userId:User, productId:Product) VALUES ($ar
 
 ```graphql
 type Mutation {
-  addProductToFavorite(userId: ID!, productId: ID!): Product
+  # Return type automatically set to Boolean! for INSERT operations
+  addProductToFavorite(userId: ID!, productId: ID!)
     @sql_query(
       query: "INSERT INTO $join_table(user_favorite_products) (userId:User, productId:Product) VALUES ($args.userId, $args.productId)"
     )
 }
 ```
+
+**Note:** The return type `Boolean!` is automatically inferred - you don't need to specify it in your schema.
 
 When this mutation is called:
 
