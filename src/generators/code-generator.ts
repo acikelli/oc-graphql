@@ -1609,19 +1609,29 @@ type TaskResult${this.capitalizeFirst(q.name)} {
 
   /**
    * Transform DELETE query to SELECT s3Key and relationId query
-   * Example: "DELETE ufp FROM user_favorite_products ufp INNER JOIN products p ON ufp.productId = p.productId WHERE p.brandId = $args.brandId;"
+   * DELETE queries must use $join_table() wrapper: "DELETE alias FROM $join_table(table_name) alias ..."
+   * Example: "DELETE ufp FROM $join_table(user_favorite_products) ufp INNER JOIN products p ON ufp.productId = p.productId WHERE p.brandId = $args.brandId;"
    * Becomes: "SELECT ufp.s3Key, ufp.relationId FROM user_favorite_products ufp INNER JOIN products p ON ufp.productId = p.productId WHERE p.brandId = $args.brandId;"
    */
   private transformDeleteToSelectS3Key(deleteQuery: string): string {
     // Remove trailing semicolon if present
     let query = deleteQuery.trim().replace(/;\s*$/, "");
 
-    // Match DELETE pattern: DELETE [table_alias] FROM table_name [alias] ...
-    // or DELETE FROM table_name [alias] ...
-    const deletePattern = /^DELETE\s+(?:\w+\s+)?FROM\s+/i;
+    // Validate that DELETE query uses $join_table() wrapper
+    if (!query.includes("$join_table(")) {
+      throw new Error(
+        "DELETE queries must use $join_table() wrapper for table names. Example: DELETE alias FROM $join_table(table_name) alias ..."
+      );
+    }
+
+    // Match DELETE pattern: DELETE [table_alias] FROM $join_table(table_name) [alias] ...
+    // or DELETE FROM $join_table(table_name) [alias] ...
+    const deletePattern = /^DELETE\s+(?:\w+\s+)?FROM\s+\$join_table\s*\(/i;
 
     if (!deletePattern.test(query)) {
-      throw new Error("Invalid DELETE query format");
+      throw new Error(
+        "Invalid DELETE query format. Must use: DELETE [alias] FROM $join_table(table_name) [alias] ..."
+      );
     }
 
     // Extract the table alias (if present after DELETE)
@@ -1632,6 +1642,10 @@ type TaskResult${this.capitalizeFirst(q.name)} {
 
     // Remove DELETE [alias] FROM part
     query = query.replace(/^DELETE\s+(?:\w+\s+)?FROM\s+/i, "");
+
+    // Remove $join_table() wrapper (same as INSERT queries)
+    // Pattern: $join_table(table_name) -> table_name
+    query = query.replace(/\$join_table\s*\(([^)]+)\)/g, "$1");
 
     // Find the first table name/alias after FROM
     // This handles: table_name alias or just table_name

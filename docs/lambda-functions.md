@@ -1317,8 +1317,8 @@ This ensures that when you delete a `User`, all related join table entries (like
 
 The framework supports DELETE SQL operations through asynchronous deletion tasks:
 
-1. **Query Transformation**: DELETE queries are automatically transformed to SELECT queries that return both `s3Key` and `relationId` values
-   - Example: `DELETE ufp FROM user_favorite_products ufp ...` → `SELECT ufp.s3Key, ufp.relationId FROM user_favorite_products ufp ...`
+1. **Query Transformation**: DELETE queries **must use `$join_table()` wrapper** for table names (similar to INSERT queries). The wrapper is automatically removed before execution, then the query is transformed to a SELECT query that returns both `s3Key` and `relationId` values
+   - Example: `DELETE ufp FROM $join_table(user_favorite_products) ufp ...` → `DELETE ufp FROM user_favorite_products ufp ...` → `SELECT ufp.s3Key, ufp.relationId FROM user_favorite_products ufp ...`
 2. **Task Creation**: A task entity is created with `taskType: "deletionTask"`
 3. **Async Execution**: The SELECT query is executed via Athena
 4. **EventBridge Tracking**: Execution tracker monitors query status

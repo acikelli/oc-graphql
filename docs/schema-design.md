@@ -290,10 +290,12 @@ When you define a mutation with a DELETE SQL query:
 
 #### DELETE Query Format
 
+DELETE queries **must use the `$join_table()` wrapper** for table names, similar to INSERT queries. The wrapper is automatically removed before the query is executed.
+
 DELETE queries must follow this format:
 
 ```sql
-DELETE [table_alias] FROM table_name [alias] [JOIN clauses] [WHERE clause];
+DELETE [table_alias] FROM $join_table(table_name) [alias] [JOIN clauses] [WHERE clause];
 ```
 
 **Examples:**
@@ -304,14 +306,14 @@ type Mutation {
   # Return type automatically inferred - generates triggerTask mutation
   removeBrandFromFavorites(brandId: ID!)
     @sql_query(
-      query: "DELETE ufp FROM user_favorite_products ufp INNER JOIN products p ON ufp.productId = p.productId WHERE p.brandId = $args.brandId;"
+      query: "DELETE ufp FROM $join_table(user_favorite_products) ufp INNER JOIN products p ON ufp.productId = p.productId WHERE p.brandId = $args.brandId;"
     )
 
   # Delete entries from a specific table
   # Return type automatically inferred - generates triggerTask mutation
-  removeExpiredSessions
+  removeProductFromFavorite(productId: ID!)
     @sql_query(
-      query: "DELETE s FROM sessions s WHERE s.expiresAt < CURRENT_TIMESTAMP;"
+      query: "DELETE ufp FROM $join_table(user_favorite_products) ufp WHERE ufp.productId = $args.productId;"
     )
 }
 ```
@@ -320,7 +322,18 @@ type Mutation {
 
 The framework automatically transforms DELETE queries:
 
+1. **Removes `$join_table()` wrapper**: The `$join_table(table_name)` is replaced with `table_name` before execution
+2. **Transforms to SELECT**: The DELETE query is transformed to a SELECT query that returns both `s3Key` and `relationId`
+
 **Original DELETE Query:**
+
+```sql
+DELETE ufp FROM $join_table(user_favorite_products) ufp
+INNER JOIN products p ON ufp.productId = p.productId
+WHERE p.brandId = $args.brandId;
+```
+
+**After Removing `$join_table()` Wrapper:**
 
 ```sql
 DELETE ufp FROM user_favorite_products ufp
@@ -362,7 +375,7 @@ For each DELETE mutation, the framework automatically generates:
 type Mutation {
   removeBrandFromFavorites(brandId: ID!): Boolean
     @sql_query(
-      query: "DELETE ufp FROM user_favorite_products ufp INNER JOIN products p ON ufp.productId = p.productId WHERE p.brandId = $args.brandId;"
+      query: "DELETE ufp FROM $join_table(user_favorite_products) ufp INNER JOIN products p ON ufp.productId = p.productId WHERE p.brandId = $args.brandId;"
     )
 }
 
@@ -449,10 +462,12 @@ Deletion tasks are stored in DynamoDB with:
 
 #### Important Notes
 
-- **Table Alias Required**: DELETE queries must use table aliases (e.g., `DELETE ufp FROM ...`)
+- **`$join_table()` Required**: DELETE queries **must** wrap table names with `$join_table()` wrapper (e.g., `DELETE alias FROM $join_table(table_name) alias ...`)
+- **Table Alias Required**: DELETE queries must use table aliases (e.g., `DELETE ufp FROM $join_table(...) ufp ...`)
+- **Wrapper Removal**: The `$join_table()` wrapper is automatically removed before query execution (similar to INSERT queries)
 - **s3Key Column**: The target table must have an `s3Key` column (automatically added for join tables)
 - **Asynchronous**: Deletion is asynchronous - use `taskResult` query to track progress
-- **S3 Only**: DELETE operations only remove S3 Parquet files, not DynamoDB items (use cascade deletion for that)
+- **Complete Cleanup**: DELETE operations remove both S3 Parquet files and DynamoDB items (`joinTableData` and `joinRelation` items)
 - **Error Handling**: Check `taskStatus` for `FAILED` and handle errors appropriately
 
 #### Best Practices
@@ -624,7 +639,7 @@ type Mutation {
 
   removeFromFavorites(userId: ID!, productId: ID!): Boolean!
     @sql_query(
-      query: "DELETE FROM $join_table(user_favorites) WHERE userId = $args.userId AND productId = $args.productId"
+      query: "DELETE uf FROM $join_table(user_favorites) uf WHERE uf.userId = $args.userId AND uf.productId = $args.productId;"
     )
 }
 
@@ -653,7 +668,7 @@ type Mutation {
 
   unfollowUser(followerId: ID!, followingId: ID!): Boolean!
     @sql_query(
-      query: "DELETE FROM $join_table(user_follows) WHERE followerId = $args.followerId AND followingId = $args.followingId"
+      query: "DELETE uf FROM $join_table(user_follows) uf WHERE uf.followerId = $args.followerId AND uf.followingId = $args.followingId;"
     )
 }
 
@@ -957,7 +972,7 @@ type Mutation {
 
   unlikePost(userId: ID!, postId: ID!): Boolean!
     @sql_query(
-      query: "DELETE FROM $join_table(post_likes) WHERE userId = $args.userId AND postId = $args.postId"
+      query: "DELETE pl FROM $join_table(post_likes) pl WHERE pl.userId = $args.userId AND pl.postId = $args.postId;"
     )
 }
 ```

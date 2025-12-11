@@ -111,6 +111,9 @@ export async function validateSchema(schemaString: string): Promise<void> {
     // Validate custom directives
     validateCustomDirectives(schemaString);
 
+    // Validate DELETE queries use $join_table()
+    validateDeleteQueries(schemaString);
+
     // Validate type structure
     validateTypeStructure(schemaString);
   } catch (error) {
@@ -162,6 +165,65 @@ function validateCustomDirectives(schemaString: string): void {
     const tableName = match.match(/\$join_table\(([^)]+)\)/)?.[1];
     if (!tableName || tableName.trim().length === 0) {
       throw new Error(`Invalid join table reference: ${match}`);
+    }
+  }
+}
+
+function validateDeleteQueries(schemaString: string): void {
+  // Extract Mutation type
+  const mutationTypePattern = /type\s+Mutation\s*{([\s\S]*?)}/;
+  const mutationMatch = schemaString.match(mutationTypePattern);
+
+  if (!mutationMatch) {
+    return; // No Mutation type found
+  }
+
+  const mutationFields = mutationMatch[1];
+
+  // Find all @sql_query directives in Mutation fields
+  const sqlQueryPattern = /@sql_query\s*\(\s*query:\s*"([^"]+)"/g;
+  let match: RegExpMatchArray | null;
+
+  // Find the field name for each DELETE query
+  const fieldPattern = /(\w+)\s*\([^)]*\)/g;
+  const fields: Array<{ name: string; query: string }> = [];
+  let fieldMatch: RegExpMatchArray | null;
+  let currentFieldName = "";
+
+  // Extract field names and their queries
+  const lines = mutationFields.split("\n");
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    const fieldNameMatch = line.match(/^\s*(\w+)\s*\(/);
+    if (fieldNameMatch) {
+      currentFieldName = fieldNameMatch[1];
+    }
+
+    const queryMatch = line.match(/query:\s*"([^"]+)"/);
+    if (queryMatch && currentFieldName) {
+      const query = queryMatch[1].trim();
+      if (query.toUpperCase().startsWith("DELETE")) {
+        fields.push({ name: currentFieldName, query });
+      }
+    }
+  }
+
+  // Validate each DELETE query uses $join_table()
+  for (const field of fields) {
+    if (!field.query.includes("$join_table(")) {
+      throw new Error(
+        `DELETE query in mutation '${field.name}' must use $join_table() wrapper for table names. ` +
+          `Example: DELETE alias FROM $join_table(table_name) alias ...`
+      );
+    }
+
+    // Validate the format: DELETE [alias] FROM $join_table(table_name) [alias] ...
+    const deletePattern = /DELETE\s+(?:\w+\s+)?FROM\s+\$join_table\s*\(/i;
+    if (!deletePattern.test(field.query)) {
+      throw new Error(
+        `Invalid DELETE query format in mutation '${field.name}'. ` +
+          `Must use: DELETE [alias] FROM $join_table(table_name) [alias] ...`
+      );
     }
   }
 }

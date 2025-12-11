@@ -18,11 +18,11 @@ type Mutation {
     )
   removeProductFromFavorite(productId: ID!)
     @sql_query(
-      query: "DELETE ufp FROM user_favorite_products ufp WHERE ufp.productId = $args.productId;"
+      query: "DELETE ufp FROM $join_table(user_favorite_products) ufp WHERE ufp.productId = $args.productId;"
     )
   removeBrandFromFavorites(brandId: ID!)
     @sql_query(
-      query: "DELETE ufp FROM user_favorite_products ufp INNER JOIN product p ON ufp.productId = p.id WHERE p.brandId = $args.brandId;"
+      query: "DELETE ufp FROM $join_table(user_favorite_products) ufp INNER JOIN product p ON ufp.productId = p.id WHERE p.brandId = $args.brandId;"
     )
 }
 
