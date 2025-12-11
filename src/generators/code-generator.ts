@@ -20,7 +20,7 @@ export class CodeGenerator {
 
     // Generate CRUD functions for each type (skip @task_response types)
     for (const type of this.schemaMetadata.types) {
-      if (!type.isPrimitive && !type.isResolver && !type.isTaskResponse) {
+      if (!type.isPrimitive && !type.isTaskResponse) {
         lambdaFunctions[
           `ocg-${this.projectName}-create-${type.name.toLowerCase()}.js`
         ] = this.generateCreateFunction(type);
@@ -36,40 +36,27 @@ export class CodeGenerator {
       }
     }
 
-    // Generate resolver functions for @sql_query directives
-    for (const query of this.schemaMetadata.queries) {
-      if (query.sqlQuery) {
-        lambdaFunctions[`ocg-${this.projectName}-query-${query.name}.js`] =
-          this.generateSqlQueryFunction(query);
-      }
-    }
+    // Query fields are automatically tasks - no direct Lambda functions generated
+    // Users must use triggerTask... mutations and taskResult... queries instead
 
     for (const mutation of this.schemaMetadata.mutations) {
       if (mutation.sqlQuery) {
-        lambdaFunctions[
-          `ocg-${this.projectName}-mutation-${mutation.name}.js`
-        ] = this.generateSqlQueryFunction(mutation);
-      }
-    }
+        const query = mutation.sqlQuery.query.trim().toUpperCase();
+        const isDeleteQuery = query.startsWith("DELETE");
 
-    // Generate resolver functions for types with @resolver directive
-    for (const type of this.schemaMetadata.types) {
-      if (type.isResolver) {
-        lambdaFunctions[
-          `ocg-${this.projectName}-resolver-${type.name.toLowerCase()}.js`
-        ] = this.generateResolverFunction(type);
-      }
-    }
+        if (isDeleteQuery) {
+          // Generate task mutation and result query for DELETE operations
+          lambdaFunctions[
+            `ocg-${this.projectName}-mutation-triggerTask${this.capitalizeFirst(mutation.name)}.js`
+          ] = this.generateTriggerDeletionTaskMutation(mutation);
 
-    // Generate individual field resolvers for fields with @sql_query in regular types
-    for (const type of this.schemaMetadata.types) {
-      if (!type.isPrimitive && !type.isResolver) {
-        for (const field of type.fields) {
-          if (field.sqlQuery) {
-            lambdaFunctions[
-              `ocg-${this.projectName}-field-${type.name.toLowerCase()}-${field.name}.js`
-            ] = this.generateSqlQueryFunction(field);
-          }
+          lambdaFunctions[
+            `ocg-${this.projectName}-query-taskResult${this.capitalizeFirst(mutation.name)}.js`
+          ] = this.generateDeletionTaskResultQuery(mutation);
+        } else {
+          lambdaFunctions[
+            `ocg-${this.projectName}-mutation-${mutation.name}.js`
+          ] = this.generateSqlQueryFunction(mutation);
         }
       }
     }
@@ -77,6 +64,20 @@ export class CodeGenerator {
     // Generate DynamoDB stream processor (Python with Parquet support)
     lambdaFunctions[`ocg-${this.projectName}-stream-processor.py`] =
       this.generateStreamProcessor();
+
+    // Generate cascade deletion queue listener Lambda
+    lambdaFunctions[`ocg-${this.projectName}-cascade-deletion-listener.js`] =
+      this.generateCascadeDeletionListener();
+
+    // Generate deletion queue listener Lambda (for DELETE SQL operations)
+    const hasDeleteMutations = this.schemaMetadata.mutations.some((m) => {
+      const query = m.sqlQuery?.query.trim().toUpperCase() || "";
+      return query.startsWith("DELETE");
+    });
+    if (hasDeleteMutations) {
+      lambdaFunctions[`ocg-${this.projectName}-deletion-listener.js`] =
+        this.generateDeletionListener();
+    }
 
     // Generate task functions for queries with @task directive
     for (const query of this.schemaMetadata.queries) {
@@ -269,12 +270,13 @@ exports.handler = async (event) => {
 
   private generateSqlQueryFunction(field: FieldMetadata): string {
     const query = field.sqlQuery!.query;
-    const isVirtualTable = query.includes("$virtual_table(");
+    const isJoinTable = query.includes("$join_table(");
 
     return `
 const { AthenaClient, StartQueryExecutionCommand, GetQueryExecutionCommand, GetQueryResultsCommand } = require('@aws-sdk/client-athena');
-const { DynamoDBClient, PutItemCommand } = require('@aws-sdk/client-dynamodb');
-const { marshall } = require('@aws-sdk/util-dynamodb');
+const { DynamoDBClient, PutItemCommand, GetItemCommand } = require('@aws-sdk/client-dynamodb');
+const { marshall, unmarshall } = require('@aws-sdk/util-dynamodb');
+const { v4: uuidv4 } = require('uuid');
 
 const athenaClient = new AthenaClient({ region: process.env.AWS_REGION });
 const dynamoClient = new DynamoDBClient({ region: process.env.AWS_REGION });
@@ -328,10 +330,10 @@ exports.handler = async (event) => {
       });
     }
     
-    ${isVirtualTable ? this.generateVirtualTableLogic() : ""}
+    ${isJoinTable ? this.generateJoinTableLogic() : ""}
     
-    // Replace virtual table references
-    query = query.replace(/\\$virtual_table\\(([^)]+)\\)/g, '$1');
+    // Replace join table references
+    query = query.replace(/\\$join_table\\(([^)]+)\\)/g, '$1');
     
     // Execute Athena query
     const queryExecution = await athenaClient.send(new StartQueryExecutionCommand({
@@ -366,6 +368,12 @@ exports.handler = async (event) => {
       QueryExecutionId: queryExecutionId
     }));
     
+    // For INSERT operations, return Boolean
+    const queryUpper = query.trim().toUpperCase();
+    if (queryUpper.startsWith("INSERT")) {
+      return true;
+    }
+    
     // Process results
     const rows = results.ResultSet?.Rows || [];
     const headers = rows[0]?.Data?.map(col => col.VarCharValue) || [];
@@ -386,312 +394,167 @@ exports.handler = async (event) => {
 `;
   }
 
-  private generateVirtualTableLogic(): string {
+  private generateJoinTableLogic(): string {
     return `
-    // Handle virtual table insert
-    if (query.includes('INSERT INTO') && query.includes('$virtual_table(')) {
-      const virtualTableMatch = query.match(/\\$virtual_table\\(([^)]+)\\)/);
-      if (virtualTableMatch) {
-        const tableName = virtualTableMatch[1];
+    // Handle join table insert
+    if (query.includes('INSERT INTO') && query.includes('$join_table(')) {
+      const joinTableMatch = query.match(/\\$join_table\\(([^)]+)\\)/);
+      if (joinTableMatch) {
+        const tableName = joinTableMatch[1];
         
-        // Extract column names from INSERT statement
-        const insertMatch = query.match(/INSERT\\s+INTO\\s+\\$virtual_table\\([^)]+\\)\\s*\\(([^)]+)\\)/i);
-        const columnNames = insertMatch ? insertMatch[1].split(',').map(col => col.trim()) : [];
+        // Extract column definitions from INSERT statement (e.g., "userId:User, productId:Product")
+        const insertMatch = query.match(/INSERT\\s+INTO\\s+\\$join_table\\([^)]+\\)\\s*\\(([^)]+)\\)/i);
+        const columnDefs = insertMatch ? insertMatch[1].split(',').map(col => col.trim()) : [];
         
-        console.log(\`Detected columns for virtual table \${tableName}:\`, columnNames);
-        
-        // Dynamically extract field values from arguments
-        const item = {
-          entityType: tableName, // Use actual table name as entity type
-          virtualTable: tableName,
-          createdAt: new Date().toISOString()
-        };
-        
-        // Add all arguments as fields and construct PK/SK dynamically
+        // Parse entity type annotations (e.g., "userId:User" -> {column: "userId", entityType: "User"})
+        const entityMappings = [];
         const argEntries = Object.entries(event.arguments);
-        const pkFields = [];
-        const skFields = [];
+        const now = new Date().toISOString();
         
-        // Add all arguments to the item
-        argEntries.forEach(([key, value]) => {
-          item[key] = value;
-          // Use argument values to build composite keys based on detected columns
-          if (key.toLowerCase().includes('id') && columnNames.some(col => col.toLowerCase().includes(key.toLowerCase()))) {
-            if (pkFields.length === 0) {
-              pkFields.push(\`\${key.replace(/Id$/, '').toLowerCase()}#\${value}\`);
-            } else {
-              skFields.push(\`\${key.replace(/Id$/, '').toLowerCase()}#\${value}\`);
+        columnDefs.forEach(colDef => {
+          const parts = colDef.split(':');
+          if (parts.length === 2) {
+            const columnName = parts[0].trim();
+            const entityType = parts[1].trim();
+            const value = event.arguments[columnName];
+            if (value) {
+              entityMappings.push({ column: columnName, entityType, value });
             }
           }
         });
         
-        // Fallback: if no ID fields detected, use first two arguments
-        if (pkFields.length === 0 && argEntries.length >= 2) {
-          const [firstArg, secondArg] = argEntries;
-          pkFields.push(\`\${firstArg[0].replace(/Id$/, '').toLowerCase()}#\${firstArg[1]}\`);
-          skFields.push(\`\${secondArg[0].replace(/Id$/, '').toLowerCase()}#\${secondArg[1]}\`);
+        console.log(\`Detected entity mappings for join table \${tableName}:\`, entityMappings);
+        
+        if (entityMappings.length === 0) {
+          throw new Error('No entity type mappings found in join table insert');
         }
         
-        // Construct PK and SK from the field values
-        item.PK = \`relation#\${tableName}#\${pkFields.join('#')}\`;
-        item.SK = \`relation#\${tableName}#\${skFields.join('#')}\`;
+        // Create deterministic relationId from sorted entity mappings
+        // Sort by entityType first, then by value to ensure consistency
+        const sortedMappings = [...entityMappings].sort((a, b) => {
+          const typeCompare = a.entityType.localeCompare(b.entityType);
+          if (typeCompare !== 0) return typeCompare;
+          return a.value.localeCompare(b.value);
+        });
         
-        console.log(\`Creating virtual table item for \${tableName}:\`, item);
+        // Create deterministic ID: entityType1:value1|entityType2:value2|...
+        const relationIdParts = sortedMappings.map(m => \`\${m.entityType.toLowerCase()}:\${m.value}\`);
+        const relationIdString = relationIdParts.join('|');
         
-        await dynamoClient.send(new PutItemCommand({
+        // Use crypto to create a deterministic hash (SHA-256, then take first 32 chars)
+        const crypto = require('crypto');
+        const relationId = crypto.createHash('sha256').update(relationIdString).digest('hex').substring(0, 32);
+        
+        console.log(\`Generated deterministic relationId: \${relationId} from: \${relationIdString}\`);
+        
+        // Check if this relation already exists
+        const existingItemKey = {
+          PK: { S: \`joinTableData#\${relationId}\` },
+          SK: { S: \`joinTableData#\${relationId}\` }
+        };
+        
+        const existingItem = await dynamoClient.send(new GetItemCommand({
           TableName: TABLE_NAME,
-          Item: marshall(item)
+          Key: existingItemKey
         }));
         
-        return item;
-      }
-    }
-    `;
-  }
-
-  private generateResolverFunction(type: TypeMetadata): string {
-    const fieldsWithQueries = type.fields.filter((f) => f.sqlQuery);
-
-    return `
-const { AthenaClient, StartQueryExecutionCommand, GetQueryExecutionCommand, GetQueryResultsCommand } = require('@aws-sdk/client-athena');
-
-const athenaClient = new AthenaClient({ region: process.env.AWS_REGION });
-const DATABASE_NAME = process.env.ATHENA_DATABASE_NAME;
-const S3_OUTPUT_LOCATION = process.env.ATHENA_OUTPUT_LOCATION;
-
-// SQL injection prevention function
-function escapeSqlValue(value) {
-  if (value === null || value === undefined) {
-    return 'NULL';
-  } else if (typeof value === 'number') {
-    // Validate number to prevent injection via scientific notation or special values
-    if (!isFinite(value)) {
-      throw new Error('Invalid number value');
-    }
-    return value.toString();
-  } else if (typeof value === 'boolean') {
-    return value ? 'true' : 'false';
-  } else if (typeof value === 'string') {
-    // Escape for SQL while preserving user's search intent
-    let escaped = value.split("'").join("''"); // SQL standard: escape single quotes
-    // Note: We only escape quotes, not remove content, to preserve search terms
-    // Athena handles this safely when parameters are properly quoted
-    return "'" + escaped + "'";
-  } else {
-    throw new Error('Unsupported data type for SQL parameter');
-  }
-}
-
-exports.handler = async (event) => {
-  try {
-    const sourceArgs = event.source || {};
-    const fieldArgs = event.arguments || {};
-    
-    console.log('Resolver function called with:', { sourceArgs, fieldArgs });
-    
-    // Determine which field is being requested from the GraphQL info
-    const requestedField = event.info?.fieldName;
-    console.log('Requested field:', requestedField);
-    if (event.source.calculatedResponse) {
-      console.log('Returning from calculatedResponse:', requestedField);
-      return event.source.calculatedResponse[requestedField];
-    }
-    // Run all SQL queries in parallel
-    const queryPromises = [
-${fieldsWithQueries
-  .map((field) => {
-    // For list fields, return the entire result array
-    // For scalar fields, extract the value from the first row
-    // If the result has a field matching the field name, use that
-    // Otherwise, try _col0 or the first value in the object
-    const fieldType = this.schemaMetadata.types.find(
-      (t) => t.name === field.type
-    );
-    const isScalar = fieldType?.isPrimitive || false;
-
-    if (field.isList) {
-      return `
-      executeQuery(\`${field.sqlQuery!.query}\`, { ...sourceArgs, ...fieldArgs })
-        .then(result => ({ field: '${field.name}', result: result }))
-`;
-    } else {
-      // For scalar fields, extract the value from the first row
-      // Try field name first, then _col0, then first value in object
-      return `
-      executeQuery(\`${field.sqlQuery!.query}\`, { ...sourceArgs, ...fieldArgs })
-        .then(result => {
-          if (!result || result.length === 0) return { field: '${field.name}', result: null };
-          const firstRow = result[0];
-          let value = null;
-          
-          // Try to get value by field name (e.g., result[0].total for "total" field)
-          if (firstRow['${field.name}'] !== undefined) {
-            value = firstRow['${field.name}'];
-          } else if (firstRow['_col0'] !== undefined) {
-            // Fallback to _col0 (for queries like SELECT COUNT(*) without alias)
-            value = firstRow['_col0'];
-          } else {
-            // Fallback to first value in the object
-            const keys = Object.keys(firstRow);
-            if (keys.length > 0) {
-              value = firstRow[keys[0]];
-            }
-          }
-          
-          // Convert to appropriate type
-          ${
-            field.type === "Int"
-              ? `
-          if (value !== null && value !== undefined) {
-            const num = typeof value === 'string' ? parseInt(value, 10) : Number(value);
-            value = isNaN(num) ? null : num;
-          }`
-              : ""
-          }
-          ${
-            field.type === "Float"
-              ? `
-          if (value !== null && value !== undefined) {
-            const num = typeof value === 'string' ? parseFloat(value) : Number(value);
-            value = isNaN(num) ? null : num;
-          }`
-              : ""
-          }
-          ${
-            field.type === "Boolean"
-              ? `
-          if (value !== null && value !== undefined) {
-            if (typeof value === 'string') {
-              value = value.toLowerCase() === 'true' || value === '1';
-            } else {
-              value = Boolean(value);
-            }
-          }`
-              : ""
-          }
-          
-          return { field: '${field.name}', result: value };
-        })
-`;
-    }
-  })
-  .join(",\n")}
-    ];
-    
-    const results = await Promise.all(queryPromises);
-    
-    // Build response object
-    const response = {};
-    results.forEach(({ field, result }) => {
-      response[field] = result;
-    });
-    
-    // Handle @return directives - extract actual values from args or source
-    ${type.fields
-      .filter((f) => f.returnValue)
-      .map((f) => {
-        const returnValue = f.returnValue!.value;
-        if (returnValue.startsWith("$args.")) {
-          const argKey = returnValue.replace("$args.", "");
-          return `response.${f.name} = fieldArgs.${argKey};`;
-        } else if (returnValue.startsWith("$source.")) {
-          const sourceKey = returnValue.replace("$source.", "");
-          return `response.${f.name} = sourceArgs.${sourceKey};`;
-        } else {
-          // Static value
-          return `response.${f.name} = ${returnValue};`;
+        if (existingItem.Item) {
+          // Relation already exists, return Boolean (success) for INSERT operations
+          console.log(\`Relation \${relationId} already exists, returning success\`);
+          return true;
         }
-      })
-      .join("\n    ")}
-    
-    console.log('Resolver response:', response);
-    
-    // Return only the requested field value, not the entire response object
-    if (requestedField && response.hasOwnProperty(requestedField)) {
-      console.log(\`Returning field '\${requestedField}':\`, response[requestedField]);
-      return response[requestedField];
-    }
-    
-    // Fallback: return entire response if field not found
-    console.log('Field not found, returning entire response');
-    return { calculatedResponse: response, event };
-  } catch (error) {
-    console.error('Error in resolver:', error);
-    throw error;
-  }
-};
-
-async function executeQuery(query, args) {
-  try {
-    console.log('Executing query with args:', { query, args });
-    
-    // Replace parameter placeholders with SQL-safe escaping
-    Object.entries(args).forEach(([key, value]) => {
-      const argsPattern = '$args.' + key;
-      const sourcePattern = '$source.' + key;
-      const sqlSafeValue = escapeSqlValue(value);
-      query = query.split(argsPattern).join(sqlSafeValue);
-      query = query.split(sourcePattern).join(sqlSafeValue);
-    });
-    
-    console.log('Query after parameter replacement:', query);
-    
-    // Replace virtual table references
-    query = query.replace(/\$virtual_table\(([^)]+)\)/g, '$1');
-    
-    // Execute Athena query
-    const queryExecution = await athenaClient.send(new StartQueryExecutionCommand({
-      QueryString: query,
-      QueryExecutionContext: {
-        Database: DATABASE_NAME
-      },
-      ResultConfiguration: {
-        OutputLocation: S3_OUTPUT_LOCATION
+        
+        // Calculate S3 key using relationId as filename
+        const currentDate = new Date();
+        const year = currentDate.getUTCFullYear();
+        const month = String(currentDate.getUTCMonth() + 1).padStart(2, '0');
+        const day = String(currentDate.getUTCDate()).padStart(2, '0');
+        const s3Key = \`tables/\${tableName}/year=\${year}/month=\${month}/day=\${day}/\${relationId}.parquet\`;
+        
+        // Build a data item for the Parquet file (contains all entity mappings)
+        const parquetDataItem = {
+          relationId: relationId,
+          joinTableName: tableName,
+          s3Key: s3Key,
+          createdAt: now
+        };
+        
+        // Add all arguments as fields
+        argEntries.forEach(([key, value]) => {
+          parquetDataItem[key] = value;
+        });
+        
+        // Save joinRelation items for each entity type with new structure
+        // PK: joinRelation#entityType#entityId, SK: joinRelation#relationId
+        // GSI1-PK: joinRelation#relationId, GSI1-SK: joinRelation#entityType#entityId
+        for (const mapping of entityMappings) {
+          const entityTypeLower = mapping.entityType.toLowerCase();
+          const joinRelationItem = {
+            PK: \`joinRelation#\${entityTypeLower}#\${mapping.value}\`,
+            SK: \`joinRelation#\${relationId}\`,
+            'GSI1-PK': \`joinRelation#\${relationId}\`,
+            'GSI1-SK': \`joinRelation#\${entityTypeLower}#\${mapping.value}\`,
+            entityType: 'joinRelation',
+            relationId: relationId,
+            joinTableName: tableName,
+            relatedEntityType: entityTypeLower,
+            relatedEntityId: mapping.value,
+            s3Key: s3Key,
+            createdAt: now
+          };
+          
+          console.log(\`Creating joinRelation item for \${entityTypeLower}:\`, joinRelationItem);
+          
+          await dynamoClient.send(new PutItemCommand({
+            TableName: TABLE_NAME,
+            Item: marshall(joinRelationItem)
+          }));
+        }
+        
+        // Save the Parquet data item (will be processed by stream processor)
+        // Use a temporary PK/SK that the stream processor will recognize as a join table item
+        const tempItem = {
+          PK: \`joinTableData#\${relationId}\`,
+          SK: \`joinTableData#\${relationId}\`,
+          entityType: tableName,
+          joinTable: tableName,
+          ...parquetDataItem
+        };
+        
+        // Use conditional put to prevent race conditions (only insert if doesn't exist)
+        try {
+          await dynamoClient.send(new PutItemCommand({
+            TableName: TABLE_NAME,
+            Item: marshall(tempItem),
+            ConditionExpression: 'attribute_not_exists(PK)'
+          }));
+          
+          console.log(\`Created new join table relation: \${relationId}\`);
+        } catch (error) {
+          // If item already exists (race condition), fetch and return existing data
+          if (error.name === 'ConditionalCheckFailedException') {
+            console.log(\`Relation \${relationId} was created concurrently, fetching existing data\`);
+            const existingItem = await dynamoClient.send(new GetItemCommand({
+              TableName: TABLE_NAME,
+              Key: existingItemKey
+            }));
+            
+            if (existingItem.Item) {
+              // For INSERT operations, return Boolean (success)
+              return true;
+            }
+          }
+          throw error;
+        }
+        
+        // For INSERT operations, return Boolean (success)
+        return true;
       }
-    }));
-    
-    // Wait for query to complete
-    const queryExecutionId = queryExecution.QueryExecutionId;
-    let status = 'RUNNING';
-    
-    while (status === 'RUNNING' || status === 'QUEUED') {
-      await new Promise(resolve => setTimeout(resolve, 1000));
-      const result = await athenaClient.send(new GetQueryExecutionCommand({
-        QueryExecutionId: queryExecutionId
-      }));
-      console.log("Query execution result:", JSON.stringify(result, null, 2));
-      status = result.QueryExecution?.Status?.State || 'FAILED';
     }
-    
-    if (status !== 'SUCCEEDED') {
-      throw new Error(\`Query failed with status: \${status}\`);
-    }
-    
-    // Get query results
-    const results = await athenaClient.send(new GetQueryResultsCommand({
-      QueryExecutionId: queryExecutionId
-    }));
-    
-    // Process results
-    const rows = results.ResultSet?.Rows || [];
-    const headers = rows[0]?.Data?.map(col => col.VarCharValue) || [];
-    const data = rows.slice(1).map(row => {
-      const obj = {};
-      row.Data?.forEach((col, index) => {
-        obj[headers[index]] = col.VarCharValue;
-      });
-      return obj;
-    });
-    
-    console.log('Query results:', data);
-    return data;
-  } catch (error) {
-    console.error('Error executing query:', error);
-    throw error;
-  }
-}
 `;
   }
+
+  // Removed: generateResolverFunction - @resolver directive no longer supported
 
   private generateStreamProcessor(): string {
     const fs = require("fs");
@@ -721,9 +584,16 @@ logger.setLevel(logging.INFO)
 # Initialize AWS clients
 s3_client = boto3.client('s3')
 glue_client = boto3.client('glue')
+sqs_client = boto3.client('sqs')
 
 BUCKET_NAME = os.environ['S3_BUCKET_NAME']
+
+# Cache for Glue table schema checks to prevent excessive API calls
+# Key: table_name, Value: (last_check_timestamp, known_columns_set, table_exists)
+_glue_table_cache = {}
+CACHE_TTL_SECONDS = 300  # Cache for 5 minutes to avoid excessive Glue/S3 API calls
 GLUE_DATABASE = os.environ['ATHENA_DATABASE_NAME']
+CASCADE_DELETION_QUEUE_URL = os.environ.get('CASCADE_DELETION_QUEUE_URL')
 
 def lambda_handler(event, context):
     """Main Lambda handler for DynamoDB stream processing"""
@@ -757,7 +627,7 @@ def process_record(record):
         logger.error(f"Error processing stream record: {str(e)}")
 
 def handle_delete_operation(record, current_date, year, month, day):
-    """Handle DELETE operations by removing Parquet files"""
+    """Handle DELETE operations by removing Parquet files and triggering cascade deletion"""
     # Handle DELETE operations
     if 'OldImage' not in record.get('dynamodb', {}):
         return
@@ -768,33 +638,55 @@ def handle_delete_operation(record, current_date, year, month, day):
     if not entity_type:
         return
     
+    # Skip temporary joinTableData items - they are cleaned up after processing and shouldn't trigger S3 deletion
+    if item.get('PK', '').startswith('joinTableData#'):
+        logger.info(f"Skipping deletion of temporary joinTableData item: {item.get('PK')}")
+        return
+    
+    # Skip joinRelation items - they are metadata items and their deletion is handled by cascade deletion
+    # Processing them here would cause infinite loops (deleting joinRelation items creates new DELETE events)
+    if item.get('entityType') == 'joinRelation':
+        logger.info(f"Skipping deletion of joinRelation metadata item: {item.get('PK')}")
+        return
+    
     # Determine S3 key for deletion with date partitioning
-    if item.get('virtualTable'):
-        virtual_table = item['virtualTable']
+    if item.get('joinTable'):
+        # Legacy join table item - delete S3 file
+        join_table = item['joinTable']
         pk_parts = item['PK'].split('#')
         sk_parts = item['SK'].split('#')
         key_components = pk_parts[2:] + sk_parts[2:]
         key_string = '_'.join(key_components)
-        
-        # Use original creation date for deletion if available
         item_date = parse_item_date(item.get('createdAt'), current_date)
         item_year, item_month, item_day = format_date_parts(item_date)
+        s3_key = f"tables/{join_table}/year={item_year}/month={item_month}/day={item_day}/{key_string}.parquet"
         
-        s3_key = f"tables/{virtual_table}/year={item_year}/month={item_month}/day={item_day}/{key_string}.parquet"
+        logger.info(f"Deleting legacy join table S3 object: {s3_key}")
+        
+        # Delete from S3
+        try:
+            s3_client.delete_object(Bucket=BUCKET_NAME, Key=s3_key)
+            logger.info(f"Successfully deleted legacy join table S3 object: {s3_key}")
+        except Exception as e:
+            logger.warning(f"S3 object may not exist or already deleted: {s3_key} - {str(e)}")
     else:
+        # Regular entity deletion - delete S3 file and trigger cascade deletion
         item_date = parse_item_date(item.get('createdAt'), current_date)
         item_year, item_month, item_day = format_date_parts(item_date)
         
         s3_key = f"tables/{entity_type}/year={item_year}/month={item_month}/day={item_day}/{item['id']}.parquet"
-    
-    logger.info(f"Deleting S3 object: {s3_key}")
-    
-    # Delete from S3
-    try:
-        s3_client.delete_object(Bucket=BUCKET_NAME, Key=s3_key)
-        logger.info(f"Successfully deleted S3 object: {s3_key}")
-    except Exception as e:
-        logger.warning(f"S3 object may not exist or already deleted: {s3_key} - {str(e)}")
+        
+        logger.info(f"Deleting entity S3 object: {s3_key}")
+        
+        # Delete from S3
+        try:
+            s3_client.delete_object(Bucket=BUCKET_NAME, Key=s3_key)
+            logger.info(f"Successfully deleted entity S3 object: {s3_key}")
+        except Exception as e:
+            logger.warning(f"S3 object may not exist or already deleted: {s3_key} - {str(e)}")
+        
+        # Send message to SQS for cascade deletion of join relations
+        send_cascade_deletion_message(entity_type, item.get('id'))
 
 def handle_insert_update_operation(record, event_name, current_date, year, month, day):
     """Handle INSERT and MODIFY operations by creating/updating Parquet files"""
@@ -809,32 +701,91 @@ def handle_insert_update_operation(record, event_name, current_date, year, month
     if not entity_type:
         return
     
+    # Extract date from item's createdAt for partitioning (use createdAt date, not current date)
+    # This ensures updates go to the same partition as the original creation
+    item_date = parse_item_date(item.get('createdAt'), current_date)
+    item_year, item_month, item_day = format_date_parts(item_date)
+    
     # Add processing metadata
     item['_processing_timestamp'] = current_date.isoformat()
     item['_event_name'] = event_name
-    item['_partition_year'] = year
-    item['_partition_month'] = month
-    item['_partition_day'] = day
+    item['_partition_year'] = item_year
+    item['_partition_month'] = item_month
+    item['_partition_day'] = item_day
     
-    if item.get('virtualTable'):
-        handle_virtual_table_item(item, year, month, day, event_name)
+    # Check if this is a join table data item (joinTableData#relationId)
+    if item.get('PK', '').startswith('joinTableData#'):
+        handle_join_table_data_item(item, item_year, item_month, item_day, event_name)
+    elif item.get('joinTable'):
+        # Legacy join table item (should not be created anymore, but handle for backwards compatibility)
+        handle_legacy_join_table_item(item, item_year, item_month, item_day, event_name)
     else:
-        handle_regular_entity_item(item, entity_type, year, month, day, event_name)
+        handle_regular_entity_item(item, entity_type, item_year, item_month, item_day, event_name)
 
-def handle_virtual_table_item(item, year, month, day, event_name):
-    """Handle virtual table items with date partitioning"""
-    virtual_table = item['virtualTable']
+def handle_join_table_data_item(item, year, month, day, event_name):
+    """Handle join table data items using relationId as filename"""
+    join_table = item.get('joinTableName') or item.get('joinTable')
+    relation_id = item.get('relationId')
+    
+    if not relation_id:
+        logger.warning(f"Join table item missing relationId: {item}")
+        return
+    
+    if not join_table:
+        logger.warning(f"Join table item missing joinTableName: {item}")
+        return
+    
+    s3_key = f"tables/{join_table}/year={year}/month={month}/day={day}/{relation_id}.parquet"
+    table_location = f"s3://{BUCKET_NAME}/tables/{join_table}/"
+    athena_table_name = join_table
+    
+    logger.info(f"Processing join table data item for '{join_table}' with relationId '{relation_id}' - {event_name}")
+    
+    # Convert to DataFrame and write as Parquet
+    df = create_dataframe_from_item(item)
+    write_parquet_to_s3(df, s3_key)
+    
+    # Ensure Glue table exists with Parquet format
+    ensure_optimized_glue_table(athena_table_name, table_location, item, df)
+    
+    # Delete the temporary joinTableData item after processing
+    # This must happen synchronously to ensure cleanup
+    try:
+        import boto3.dynamodb.conditions as conditions
+        dynamodb_resource = boto3.resource('dynamodb')
+        table = dynamodb_resource.Table(TABLE_NAME)
+        # Use conditional delete to ensure we only delete if the item still exists
+        # This prevents duplicate processing if the item was already deleted
+        table.delete_item(
+            Key={
+                'PK': item['PK'],
+                'SK': item['SK']
+            },
+            ConditionExpression='attribute_exists(PK)'
+        )
+        logger.info(f"Successfully deleted temporary joinTableData item: {item['PK']}")
+    except dynamodb_resource.meta.client.exceptions.ConditionalCheckFailedException:
+        # Item was already deleted, skip silently (this is expected in race conditions)
+        logger.info(f"joinTableData item {item['PK']} was already deleted, skipping")
+    except Exception as e:
+        # Log error but don't fail - the Parquet file is already written
+        logger.error(f"Error deleting temporary joinTableData item {item['PK']}: {e}")
+        # Don't raise - allow processing to continue
+
+def handle_legacy_join_table_item(item, year, month, day, event_name):
+    """Handle legacy join table items (for backwards compatibility)"""
+    join_table = item['joinTable']
     pk_parts = item['PK'].split('#')
     sk_parts = item['SK'].split('#')
     
     key_components = pk_parts[2:] + sk_parts[2:]
     key_string = '_'.join(key_components)
     
-    s3_key = f"tables/{virtual_table}/year={year}/month={month}/day={day}/{key_string}.parquet"
-    table_location = f"s3://{BUCKET_NAME}/tables/{virtual_table}/"
-    athena_table_name = virtual_table
+    s3_key = f"tables/{join_table}/year={year}/month={month}/day={day}/{key_string}.parquet"
+    table_location = f"s3://{BUCKET_NAME}/tables/{join_table}/"
+    athena_table_name = join_table
     
-    logger.info(f"Processing virtual table item for '{virtual_table}' - {event_name}")
+    logger.info(f"Processing legacy join table item for '{join_table}' - {event_name}")
     
     # Convert to DataFrame and write as Parquet
     df = create_dataframe_from_item(item)
@@ -991,22 +942,175 @@ def write_parquet_to_s3(df, s3_key):
 def ensure_optimized_glue_table(table_name, location, sample_item, df):
     """Create or update Glue table with Parquet format support"""
     try:
-        # Check if table exists
-        glue_client.get_table(DatabaseName=GLUE_DATABASE, Name=table_name)
-        logger.info(f"Table '{table_name}' already exists")
+        # Check cache first to avoid excessive Glue API calls
+        current_time = datetime.utcnow().timestamp()
+        cache_key = table_name
+        cached_entry = _glue_table_cache.get(cache_key)
+        
+        # Get current DataFrame columns (excluding partition and internal fields)
+        df_column_names_lower = set()
+        for column_name in df.columns:
+            if column_name.startswith('_partition_') or column_name in ['PK', 'SK', 'GSI1-PK', 'GSI1-SK', 'entityType', 'entityId']:
+                continue
+            df_column_names_lower.add(column_name.lower())
+        
+        # Check if we have a recent cache entry and if all DataFrame columns are already known
+        if cached_entry:
+            last_check_time, known_columns_lower, table_exists = cached_entry
+            time_since_check = current_time - last_check_time
+            
+            # If cache is still valid and all DataFrame columns are already known, skip Glue API call
+            if time_since_check < CACHE_TTL_SECONDS and df_column_names_lower.issubset(known_columns_lower) and table_exists:
+                logger.debug(f"Using cached schema for table '{table_name}', skipping Glue API call")
+                return
+        
+        # Check if table exists (this is a lightweight Glue API call, not S3)
+        existing_table = glue_client.get_table(DatabaseName=GLUE_DATABASE, Name=table_name)
+        logger.info(f"Table '{table_name}' already exists, checking for new columns")
+        
+        # Get existing columns from Glue table and deduplicate (keep first occurrence)
+        # Use case-insensitive comparison to detect duplicates
+        existing_columns_list = existing_table['Table']['StorageDescriptor']['Columns']
+        seen_column_names = set()
+        seen_column_names_lower = set()  # For case-insensitive duplicate detection
+        deduplicated_existing_columns = []
+        for col in existing_columns_list:
+            col_name = col['Name']
+            col_name_lower = col_name.lower()
+            if col_name_lower not in seen_column_names_lower:
+                seen_column_names_lower.add(col_name_lower)
+                seen_column_names.add(col_name)
+                deduplicated_existing_columns.append(col)
+            else:
+                logger.warning(f"Found duplicate column '{col_name}' (case-insensitive match) in existing table '{table_name}', removing duplicate")
+        
+        # Create a lookup dictionary for quick case-insensitive checks
+        # Key: lowercase name, Value: original column definition
+        existing_columns_lower = {col['Name'].lower(): col for col in deduplicated_existing_columns}
+        existing_columns = {col['Name']: col for col in deduplicated_existing_columns}
+        
+        # Get columns from DataFrame (excluding partition columns and internal fields)
+        # Deduplicate DataFrame columns first (in case DataFrame has duplicates)
+        # Use case-insensitive comparison to catch duplicates with different casing
+        seen_df_columns = set()
+        seen_df_columns_lower = set()  # For case-insensitive duplicate detection
+        df_columns = {}
+        for column_name in df.columns:
+            if column_name.startswith('_partition_') or column_name in ['PK', 'SK', 'GSI1-PK', 'GSI1-SK', 'entityType', 'entityId']:
+                continue
+            
+            column_name_lower = column_name.lower()
+            # Skip if we've already seen this column name in DataFrame (case-insensitive)
+            if column_name_lower in seen_df_columns_lower:
+                logger.warning(f"Duplicate column '{column_name}' (case-insensitive match) found in DataFrame for table '{table_name}', skipping duplicate")
+                continue
+            
+            seen_df_columns_lower.add(column_name_lower)
+            seen_df_columns.add(column_name)
+            column_type = infer_glue_type_from_dataframe(df, column_name)
+            df_columns[column_name] = {
+                'Name': column_name,
+                'Type': column_type
+            }
+        
+        # Find new columns that don't exist in Glue table (case-insensitive check)
+        new_columns = []
+        for col_name, col_def in df_columns.items():
+            col_name_lower = col_name.lower()
+            if col_name_lower not in existing_columns_lower:
+                new_columns.append(col_def)
+                logger.info(f"Found new column '{col_name}' (type: {col_def['Type']}) to add to table '{table_name}'")
+            else:
+                # Column exists (case-insensitive match) - check if casing is different
+                existing_col = existing_columns_lower[col_name_lower]
+                if existing_col['Name'] != col_name:
+                    logger.info(f"Column '{col_name}' already exists as '{existing_col['Name']}' in table '{table_name}' (case-insensitive match), skipping")
+        
+        # Update table if new columns are found or if duplicates were removed
+        if new_columns or len(deduplicated_existing_columns) != len(existing_columns_list):
+            # Get existing table definition
+            table_input = existing_table['Table']
+            
+            # Combine deduplicated existing columns + new columns, then deduplicate again to be absolutely safe
+            # Use case-insensitive comparison for final deduplication
+            combined_columns = deduplicated_existing_columns + new_columns
+            final_seen = set()
+            final_seen_lower = set()  # For case-insensitive duplicate detection
+            updated_columns = []
+            for col in combined_columns:
+                col_name = col['Name']
+                col_name_lower = col_name.lower()
+                if col_name_lower not in final_seen_lower:
+                    final_seen_lower.add(col_name_lower)
+                    final_seen.add(col_name)
+                    updated_columns.append(col)
+                else:
+                    logger.warning(f"Duplicate column '{col_name}' (case-insensitive match) detected in final column list for table '{table_name}', removing duplicate")
+            
+            # Update the table with new columns
+            glue_client.update_table(
+                DatabaseName=GLUE_DATABASE,
+                TableInput={
+                    'Name': table_name,
+                    'Description': table_input.get('Description', ''),
+                    'PartitionKeys': table_input.get('PartitionKeys', []),
+                    'StorageDescriptor': {
+                        'Columns': updated_columns,
+                        'Location': table_input['StorageDescriptor']['Location'],
+                        'InputFormat': table_input['StorageDescriptor']['InputFormat'],
+                        'OutputFormat': table_input['StorageDescriptor']['OutputFormat'],
+                        'SerdeInfo': table_input['StorageDescriptor']['SerdeInfo'],
+                        'Parameters': table_input['StorageDescriptor'].get('Parameters', {})
+                    },
+                    'TableType': table_input.get('TableType', 'EXTERNAL_TABLE'),
+                    'Parameters': table_input.get('Parameters', {})
+                }
+            )
+            if new_columns:
+                logger.info(f"Successfully updated table '{table_name}' with {len(new_columns)} new columns: {[col['Name'] for col in new_columns]}")
+            if len(deduplicated_existing_columns) != len(existing_columns_list):
+                logger.info(f"Successfully removed {len(existing_columns_list) - len(deduplicated_existing_columns)} duplicate columns from table '{table_name}'")
+            
+            # Update cache with new columns after successful update
+            updated_columns_lower = {col['Name'].lower() for col in updated_columns}
+            _glue_table_cache[cache_key] = (current_time, updated_columns_lower, True)
+        else:
+            logger.info(f"Table '{table_name}' schema is up to date, no new columns to add")
+            # Update cache even when no changes are needed
+            existing_columns_lower_set = {col['Name'].lower() for col in deduplicated_existing_columns}
+            _glue_table_cache[cache_key] = (current_time, existing_columns_lower_set, True)
+        
         return
     except glue_client.exceptions.EntityNotFoundException:
         logger.info(f"Creating new Parquet table: {table_name}")
         create_parquet_glue_table(table_name, location, sample_item, df)
+        # Update cache after creating new table
+        df_column_names_lower_set = {col.lower() for col in df.columns if not col.startswith('_partition_') and col not in ['PK', 'SK', 'GSI1-PK', 'GSI1-SK', 'entityType', 'entityId']}
+        _glue_table_cache[cache_key] = (current_time, df_column_names_lower_set, True)
+    except Exception as e:
+        # Log error but don't fail - table might be created concurrently
+        logger.warning(f"Error checking/creating Glue table '{table_name}': {e}")
+        # Don't raise - allow processing to continue
 
 def create_parquet_glue_table(table_name, location, sample_item, df):
     """Create optimized Parquet Glue table using processed DataFrame types"""
     # Generate columns from DataFrame dtypes (more accurate than sample item)
+    # Deduplicate columns to prevent any duplicates (case-insensitive)
+    seen_column_names = set()
+    seen_column_names_lower = set()  # For case-insensitive duplicate detection
     columns = []
     for column_name in df.columns:
-        if column_name.startswith('_partition_'):
+        if column_name.startswith('_partition_') or column_name in ['PK', 'SK', 'GSI1-PK', 'GSI1-SK', 'entityType', 'entityId']:
             continue
-            
+        
+        column_name_lower = column_name.lower()
+        # Skip if we've already seen this column name (case-insensitive deduplicate)
+        if column_name_lower in seen_column_names_lower:
+            logger.warning(f"Duplicate column '{column_name}' (case-insensitive match) found in DataFrame for table '{table_name}', skipping duplicate")
+            continue
+        
+        seen_column_names_lower.add(column_name_lower)
+        seen_column_names.add(column_name)
         column_type = infer_glue_type_from_dataframe(df, column_name)
         columns.append({
             'Name': column_name,
@@ -1157,6 +1261,28 @@ def format_date_parts(date_obj):
         date_obj.strftime('%m'),
         date_obj.strftime('%d')
     )
+
+def send_cascade_deletion_message(entity_type, entity_id):
+    """Send message to SQS queue for cascade deletion of join relations"""
+    if not CASCADE_DELETION_QUEUE_URL:
+        logger.warning("CASCADE_DELETION_QUEUE_URL not set, skipping cascade deletion")
+        return
+    
+    try:
+        message = {
+            'entityType': entity_type,
+            'entityId': entity_id,
+            'timestamp': datetime.utcnow().isoformat()
+        }
+        
+        sqs_client.send_message(
+            QueueUrl=CASCADE_DELETION_QUEUE_URL,
+            MessageBody=json.dumps(message)
+        )
+        
+        logger.info(f"Sent cascade deletion message for {entity_type}#{entity_id}")
+    except Exception as e:
+        logger.error(f"Error sending cascade deletion message: {str(e)}")
 `;
     }
   }
@@ -1191,7 +1317,7 @@ def format_date_parts(date_obj):
 
     // Generate CreateXInput type
     for (const type of this.schemaMetadata.types) {
-      if (!type.isPrimitive && !type.isResolver) {
+      if (!type.isPrimitive && !type.isTaskResponse) {
         const createFields = type.fields
           .filter(
             (field) =>
@@ -1254,66 +1380,30 @@ def format_date_parts(date_obj):
   }
 
   private generateTypeDefinition(type: TypeMetadata): string {
-    let fields: string;
+    // For regular types, include only scalar fields (no @sql_query on type fields)
+    const fields = type.fields
+      .filter((field) => {
+        // Include only scalar types (no @sql_query on type fields)
+        return this.isScalarType(field.type);
+      })
+      .map((field) => {
+        let fieldType = field.type;
 
-    if (type.isResolver) {
-      // For resolver types, include all fields since they're resolved by Lambda functions
-      fields = type.fields
-        .map((field) => {
-          let fieldType = field.type;
+        // Handle list types
+        if (field.isList) {
+          fieldType = `[${fieldType}!]`;
+        }
 
-          // Handle list types
-          if (field.isList) {
-            fieldType = `[${fieldType}!]`;
-          }
+        // Handle required types
+        if (field.isRequired) {
+          fieldType = `${fieldType}!`;
+        }
 
-          // Handle required types
-          if (field.isRequired) {
-            fieldType = `${fieldType}!`;
-          }
-
-          // Include arguments if field has them
-          const args = this.generateFieldArguments(field);
-          return `  ${field.name}${args}: ${fieldType}`;
-        })
-        .join("\n");
-    } else {
-      // For regular types, include scalar fields AND fields with SQL queries AND fields that return resolver types
-      fields = type.fields
-        .filter((field) => {
-          // Include if it's a scalar type
-          if (this.isScalarType(field.type)) return true;
-
-          // Include if it has a SQL query
-          if (field.sqlQuery) return true;
-
-          // Include if it returns a resolver type
-          const referencedType = this.schemaMetadata.types.find(
-            (t) => t.name === field.type
-          );
-          if (referencedType && referencedType.isResolver) return true;
-
-          return false;
-        })
-        .map((field) => {
-          let fieldType = field.type;
-
-          // Handle list types
-          if (field.isList) {
-            fieldType = `[${fieldType}!]`;
-          }
-
-          // Handle required types
-          if (field.isRequired) {
-            fieldType = `${fieldType}!`;
-          }
-
-          // Include arguments if field has them
-          const args = this.generateFieldArguments(field);
-          return `  ${field.name}${args}: ${fieldType}`;
-        })
-        .join("\n");
-    }
+        // Include arguments if field has them
+        const args = this.generateFieldArguments(field);
+        return `  ${field.name}${args}: ${fieldType}`;
+      })
+      .join("\n");
 
     return `type ${type.name} {\n${fields}\n}`;
   }
@@ -1336,12 +1426,12 @@ def format_date_parts(date_obj):
 
   private generateRootTypes(): string {
     const crudQueries = this.schemaMetadata.types
-      .filter((type) => !type.isPrimitive && !type.isResolver)
+      .filter((type) => !type.isPrimitive && !type.isTaskResponse)
       .map((type) => `  read${type.name}(id: ID!): ${type.name}`)
       .join("\n");
 
     const crudMutations = this.schemaMetadata.types
-      .filter((type) => !type.isPrimitive && !type.isResolver)
+      .filter((type) => !type.isPrimitive && !type.isTaskResponse)
       .flatMap((type) => [
         `  create${type.name}(input: Create${type.name}Input!): ${type.name}!`,
         `  update${type.name}(id: ID!, input: Update${type.name}Input!): ${type.name}!`,
@@ -1349,27 +1439,17 @@ def format_date_parts(date_obj):
       ])
       .join("\n");
 
-    // Generate custom queries with their arguments
-    const customQueries = this.schemaMetadata.queries
-      .map((q) => {
-        const args = q.arguments
-          ? q.arguments
-              .map((arg) => {
-                const argType = arg.isList ? `[${arg.type}!]` : arg.type;
-                const required = arg.isRequired ? "!" : "";
-                return `${arg.name}: ${argType}${required}`;
-              })
-              .join(", ")
-          : "";
-        const argsString = args ? `(${args})` : "";
-        const returnType = q.isList ? `[${q.type}!]` : q.type;
-        const required = q.isRequired ? "!" : "";
-        return `  ${q.name}${argsString}: ${returnType}${required}`;
-      })
-      .join("\n");
+    // Original Query fields are not included - they are replaced by triggerTask mutations and taskResult queries
+    // All Query fields are automatically tasks, so users must use triggerTask... and taskResult... APIs
+    const customQueries = "";
 
     // Generate custom mutations with their arguments
+    // Exclude DELETE mutations - they are handled as triggerTask mutations
     const customMutations = this.schemaMetadata.mutations
+      .filter((m) => {
+        const query = m.sqlQuery?.query.trim().toUpperCase() || "";
+        return !query.startsWith("DELETE");
+      })
       .map((m) => {
         const args = m.arguments
           ? m.arguments
@@ -1381,9 +1461,19 @@ def format_date_parts(date_obj):
               .join(", ")
           : "";
         const argsString = args ? `(${args})` : "";
-        const returnType = m.isList ? `[${m.type}!]` : m.type;
-        const required = m.isRequired ? "!" : "";
-        return `  ${m.name}${argsString}: ${returnType}${required}`;
+
+        // Automatically set return type for INSERT operations
+        const query = m.sqlQuery?.query.trim().toUpperCase() || "";
+        let returnType: string;
+        if (query.startsWith("INSERT")) {
+          returnType = "Boolean!";
+        } else {
+          returnType = m.isList ? `[${m.type}!]` : m.type;
+          const required = m.isRequired ? "!" : "";
+          returnType += required;
+        }
+
+        return `  ${m.name}${argsString}: ${returnType}`;
       })
       .join("\n");
 
@@ -1414,17 +1504,49 @@ def format_date_parts(date_obj):
       })
       .join("\n");
 
+    // Generate deletion task mutations and result queries for DELETE mutations
+    const deletionTaskMutations = this.schemaMetadata.mutations
+      .filter((m) => {
+        const query = m.sqlQuery?.query.trim().toUpperCase() || "";
+        return query.startsWith("DELETE");
+      })
+      .map((m) => {
+        const args = m.arguments
+          ? m.arguments
+              .map((arg) => {
+                const argType = arg.isList ? `[${arg.type}!]` : arg.type;
+                const required = arg.isRequired ? "!" : "";
+                return `${arg.name}: ${argType}${required}`;
+              })
+              .join(", ")
+          : "";
+        const argsString = args ? `(${args})` : "";
+        return `  triggerTask${this.capitalizeFirst(m.name)}${argsString}: TaskTriggerResult!`;
+      })
+      .join("\n");
+
+    const deletionTaskResultQueries = this.schemaMetadata.mutations
+      .filter((m) => {
+        const query = m.sqlQuery?.query.trim().toUpperCase() || "";
+        return query.startsWith("DELETE");
+      })
+      .map((m) => {
+        return `  taskResult${this.capitalizeFirst(m.name)}(taskId: ID!): DeletionTaskResult!`;
+      })
+      .join("\n");
+
     return `
 type Query {
 ${crudQueries}
-${customQueries}
 ${taskResultQueries}
+${deletionTaskResultQueries}
 }
 
 type Mutation {
 ${crudMutations}
 ${customMutations}
 ${taskMutations}
+${deletionTaskMutations}
 }
 
 type DeleteResult {
@@ -1441,6 +1563,13 @@ enum TaskStatus {
   SUCCEEDED
   FAILED
 }
+
+type DeletionTaskResult {
+  taskStatus: TaskStatus!
+  startDate: AWSDateTime!
+  finishDate: AWSDateTime
+}
+
 ${this.schemaMetadata.queries
   .filter((q) => q.isTask && q.sqlQuery)
   .map((q) => {
@@ -1478,6 +1607,236 @@ type TaskResult${this.capitalizeFirst(q.name)} {
     return str.charAt(0).toUpperCase() + str.slice(1);
   }
 
+  /**
+   * Transform DELETE query to SELECT s3Key and relationId query
+   * Example: "DELETE ufp FROM user_favorite_products ufp INNER JOIN products p ON ufp.productId = p.productId WHERE p.brandId = $args.brandId;"
+   * Becomes: "SELECT ufp.s3Key, ufp.relationId FROM user_favorite_products ufp INNER JOIN products p ON ufp.productId = p.productId WHERE p.brandId = $args.brandId;"
+   */
+  private transformDeleteToSelectS3Key(deleteQuery: string): string {
+    // Remove trailing semicolon if present
+    let query = deleteQuery.trim().replace(/;\s*$/, "");
+
+    // Match DELETE pattern: DELETE [table_alias] FROM table_name [alias] ...
+    // or DELETE FROM table_name [alias] ...
+    const deletePattern = /^DELETE\s+(?:\w+\s+)?FROM\s+/i;
+
+    if (!deletePattern.test(query)) {
+      throw new Error("Invalid DELETE query format");
+    }
+
+    // Extract the table alias (if present after DELETE)
+    // DELETE ufp FROM ... -> ufp
+    // DELETE FROM ... -> need to find alias from FROM clause
+    const deleteMatch = query.match(/^DELETE\s+(\w+)?\s+FROM\s+/i);
+    const tableAlias = deleteMatch && deleteMatch[1] ? deleteMatch[1] : null;
+
+    // Remove DELETE [alias] FROM part
+    query = query.replace(/^DELETE\s+(?:\w+\s+)?FROM\s+/i, "");
+
+    // Find the first table name/alias after FROM
+    // This handles: table_name alias or just table_name
+    const fromMatch = query.match(/^(\w+)(?:\s+(\w+))?/);
+    const actualAlias =
+      tableAlias || (fromMatch && fromMatch[2]) || (fromMatch && fromMatch[1]);
+
+    if (!actualAlias) {
+      throw new Error("Could not determine table alias for DELETE query");
+    }
+
+    // Transform to SELECT s3Key and relationId query
+    const selectQuery = `SELECT ${actualAlias}.s3Key, ${actualAlias}.relationId FROM ${query}`;
+
+    return selectQuery;
+  }
+
+  private generateTriggerDeletionTaskMutation(mutation: FieldMetadata): string {
+    const mutationName = mutation.name;
+    const capitalizedMutationName = this.capitalizeFirst(mutationName);
+    const originalQuery = mutation.sqlQuery!.query;
+    const selectQuery = this.transformDeleteToSelectS3Key(originalQuery);
+
+    // Build arguments string
+    const argsString = mutation.arguments
+      ? mutation.arguments
+          .map((arg) => {
+            const argType = arg.isList ? `[${arg.type}!]` : arg.type;
+            const required = arg.isRequired ? "!" : "";
+            return `${arg.name}: ${argType}${required}`;
+          })
+          .join(", ")
+      : "";
+
+    return `
+const { AthenaClient, StartQueryExecutionCommand } = require('@aws-sdk/client-athena');
+const { DynamoDBClient, PutItemCommand } = require('@aws-sdk/client-dynamodb');
+const { marshall } = require('@aws-sdk/util-dynamodb');
+
+const athenaClient = new AthenaClient({ region: process.env.AWS_REGION });
+const dynamoClient = new DynamoDBClient({ region: process.env.AWS_REGION });
+const DATABASE_NAME = process.env.ATHENA_DATABASE_NAME;
+const S3_OUTPUT_LOCATION = process.env.ATHENA_OUTPUT_LOCATION;
+const TABLE_NAME = process.env.DYNAMODB_TABLE_NAME;
+
+// SQL injection prevention function
+function escapeSqlValue(value) {
+  if (value === null || value === undefined) {
+    return 'NULL';
+  } else if (typeof value === 'number') {
+    if (!isFinite(value)) {
+      throw new Error('Invalid number value');
+    }
+    return value.toString();
+  } else if (typeof value === 'boolean') {
+    return value ? 'true' : 'false';
+  } else if (typeof value === 'string') {
+    let escaped = value.split("'").join("''");
+    return "'" + escaped + "'";
+  } else {
+    throw new Error('Unsupported data type for SQL parameter');
+  }
+}
+
+exports.handler = async (event) => {
+  try {
+    console.log('Deletion task mutation event:', JSON.stringify(event, null, 2));
+    const now = new Date().toISOString();
+    
+    // Transform DELETE query to SELECT s3Key query
+    let sqlQuery = \`${selectQuery.replace(/\$/g, "\\$")}\`;
+    console.log('Transformed SELECT query:', sqlQuery);
+    
+    // Replace parameter placeholders
+    if (event.arguments) {
+      Object.entries(event.arguments).forEach(([key, value]) => {
+        const argsPattern = '$args.' + key;
+        const sqlSafeValue = escapeSqlValue(value);
+        sqlQuery = sqlQuery.split(argsPattern).join(sqlSafeValue);
+      });
+    }
+    
+    console.log('Final SQL query:', sqlQuery);
+    
+    // Start Athena query execution
+    const queryExecution = await athenaClient.send(new StartQueryExecutionCommand({
+      QueryString: sqlQuery,
+      QueryExecutionContext: {
+        Database: DATABASE_NAME
+      },
+      ResultConfiguration: {
+        OutputLocation: S3_OUTPUT_LOCATION
+      },
+      ClientRequestToken: 'deletion-task-' + Date.now() + '-' + Math.random().toString(36).substring(7)
+    }));
+    
+    console.log('Athena query execution response:', JSON.stringify(queryExecution, null, 2));
+    
+    const executionId = queryExecution.QueryExecutionId;
+    
+    if (!executionId) {
+      console.error('QueryExecutionId is missing from Athena response:', queryExecution);
+      throw new Error('Failed to start Athena query execution: QueryExecutionId is missing');
+    }
+    
+    // Save task entity with taskType: "deletionTask"
+    const taskItem = {
+      PK: \`task#\${executionId}\`,
+      SK: \`task#\${executionId}\`,
+      entityType: 'task',
+      taskId: executionId,
+      taskType: 'deletionTask',
+      mutationName: '${mutationName}',
+      taskStatus: 'RUNNING',
+      startDate: now,
+      finishDate: null,
+      createdAt: now,
+      updatedAt: now
+    };
+    
+    await dynamoClient.send(new PutItemCommand({
+      TableName: TABLE_NAME,
+      Item: marshall(taskItem)
+    }));
+    
+    return { taskId: executionId };
+  } catch (error) {
+    console.error('Error triggering deletion task:', error);
+    throw error;
+  }
+};
+`;
+  }
+
+  private generateDeletionTaskResultQuery(mutation: FieldMetadata): string {
+    const mutationName = mutation.name;
+    const capitalizedMutationName = this.capitalizeFirst(mutationName);
+
+    return `
+const { DynamoDBClient, GetItemCommand } = require('@aws-sdk/client-dynamodb');
+const { AthenaClient, GetQueryExecutionCommand } = require('@aws-sdk/client-athena');
+const { unmarshall } = require('@aws-sdk/util-dynamodb');
+
+const dynamoClient = new DynamoDBClient({ region: process.env.AWS_REGION });
+const athenaClient = new AthenaClient({ region: process.env.AWS_REGION });
+const TABLE_NAME = process.env.DYNAMODB_TABLE_NAME;
+
+exports.handler = async (event) => {
+  try {
+    const taskId = event.arguments.taskId;
+    
+    // Get task entity
+    const taskResult = await dynamoClient.send(new GetItemCommand({
+      TableName: TABLE_NAME,
+      Key: {
+        PK: { S: \`task#\${taskId}\` },
+        SK: { S: \`task#\${taskId}\` }
+      }
+    }));
+    
+    if (!taskResult.Item) {
+      throw new Error('Task not found');
+    }
+    
+    const task = unmarshall(taskResult.Item);
+    
+    // Check execution status
+    let taskStatus = 'RUNNING';
+    let finishDate = null;
+    
+    try {
+      const execResult = await athenaClient.send(new GetQueryExecutionCommand({
+        QueryExecutionId: taskId
+      }));
+      
+      const athenaStatus = execResult.QueryExecution?.Status?.State || 'UNKNOWN';
+      const statusChangeDateTime = execResult.QueryExecution?.Status?.StateChangeDateTime;
+      
+      if (athenaStatus === 'RUNNING' || athenaStatus === 'QUEUED') {
+        taskStatus = 'RUNNING';
+      } else if (athenaStatus === 'SUCCEEDED') {
+        taskStatus = 'SUCCEEDED';
+        finishDate = statusChangeDateTime || new Date().toISOString();
+      } else if (athenaStatus === 'FAILED' || athenaStatus === 'CANCELLED') {
+        taskStatus = 'FAILED';
+        finishDate = statusChangeDateTime || new Date().toISOString();
+      }
+    } catch (error) {
+      console.error(\`Error checking execution \${taskId}:\`, error);
+      taskStatus = 'FAILED';
+    }
+    
+    return {
+      taskStatus: taskStatus,
+      startDate: task.startDate,
+      finishDate: finishDate
+    };
+  } catch (error) {
+    console.error('Error getting deletion task result:', error);
+    throw error;
+  }
+};
+`;
+  }
+
   private countSqlQueriesInQuery(query: FieldMetadata): number {
     // For simple queries with @sql_query, count is 1
     if (query.sqlQuery) {
@@ -1485,15 +1844,7 @@ type TaskResult${this.capitalizeFirst(q.name)} {
     }
 
     // If query returns a resolver type, count SQL queries in that type
-    const resolverType = this.schemaMetadata.types.find(
-      (t) => t.name === query.type && t.isResolver
-    );
-
-    if (resolverType) {
-      // Count all fields with @sql_query in the resolver type
-      return resolverType.fields.filter((f) => f.sqlQuery).length;
-    }
-
+    // @resolver directive no longer supported
     return 0;
   }
 
@@ -1558,8 +1909,8 @@ exports.handler = async (event) => {
       });
     }
     
-    // Replace virtual table references
-    sqlQuery = sqlQuery.replace(/\\$virtual_table\\(([^)]+)\\)/g, '$1');
+    // Replace join table references
+    sqlQuery = sqlQuery.replace(/\\$join_table\\(([^)]+)\\)/g, '$1');
     
     // Start Athena query execution
     const queryExecution = await athenaClient.send(new StartQueryExecutionCommand({
@@ -1574,6 +1925,10 @@ exports.handler = async (event) => {
     
     // Use execution ID as task ID (only one query per task)
     const taskId = queryExecution.QueryExecutionId;
+    
+    if (!taskId) {
+      throw new Error('Failed to start Athena query execution: QueryExecutionId is missing');
+    }
     
     // Create task entity
     const taskItem = {
@@ -1608,6 +1963,31 @@ exports.handler = async (event) => {
     const capitalizedQueryName = this.capitalizeFirst(queryName);
     const returnType = query.isList ? `[${query.type}!]` : query.type;
 
+    // Get the response type metadata to build field mapping
+    const responseType = this.schemaMetadata.types.find(
+      (t) => t.name === query.type
+    );
+    const graphQLFields: string[] = [];
+    const athenaToGraphQLMap: Record<string, string> = {};
+
+    // Track datetime fields for conversion
+    const datetimeFields: string[] = [];
+
+    if (responseType) {
+      // Create reverse mapping: lowercase Athena column name -> GraphQL camelCase field name
+      responseType.fields.forEach((field) => {
+        const graphQLFieldName = field.name;
+        const athenaColumnName = field.name.toLowerCase();
+        graphQLFields.push(graphQLFieldName);
+        athenaToGraphQLMap[athenaColumnName] = graphQLFieldName;
+
+        // Track AWSDateTime fields for format conversion
+        if (field.type === "AWSDateTime") {
+          datetimeFields.push(graphQLFieldName);
+        }
+      });
+    }
+
     return `
 const { DynamoDBClient, GetItemCommand, UpdateItemCommand } = require('@aws-sdk/client-dynamodb');
 const { AthenaClient, GetQueryExecutionCommand, GetQueryResultsCommand } = require('@aws-sdk/client-athena');
@@ -1616,6 +1996,63 @@ const { unmarshall } = require('@aws-sdk/util-dynamodb');
 const dynamoClient = new DynamoDBClient({ region: process.env.AWS_REGION });
 const athenaClient = new AthenaClient({ region: process.env.AWS_REGION });
 const TABLE_NAME = process.env.DYNAMODB_TABLE_NAME;
+
+// Mapping from Athena lowercase column names to GraphQL camelCase field names
+const athenaToGraphQLMap = ${JSON.stringify(athenaToGraphQLMap)};
+const graphQLFields = ${JSON.stringify(graphQLFields)};
+const datetimeFields = ${JSON.stringify(datetimeFields)};
+
+// Helper function to map Athena column names to GraphQL field names (case-insensitive)
+function mapAthenaToGraphQL(athenaColumnName) {
+  const lowerColumn = athenaColumnName.toLowerCase();
+  // Look up in the mapping
+  if (athenaToGraphQLMap[lowerColumn]) {
+    return athenaToGraphQLMap[lowerColumn];
+  }
+  // Fallback: try to find case-insensitive match in GraphQL fields
+  for (const graphQLField of graphQLFields) {
+    if (graphQLField.toLowerCase() === lowerColumn) {
+      return graphQLField;
+    }
+  }
+  // Fallback: return original if no match found
+  return athenaColumnName;
+}
+
+// Helper function to convert Athena datetime format to ISO 8601
+// Athena returns: "2025-12-09 09:38:26.778" (SQL format)
+// GraphQL AWSDateTime expects: "2025-12-09T09:38:26.778Z" (ISO 8601)
+function convertDateTime(value, fieldName) {
+  if (!value || !datetimeFields.includes(fieldName)) {
+    return value;
+  }
+  
+  if (typeof value !== 'string') {
+    return value;
+  }
+  
+  // If already in ISO format (contains T), check if it has timezone
+  if (value.includes('T')) {
+    // If it ends with Z or has timezone offset (+/-HH:MM), return as-is
+    if (value.endsWith('Z') || /[+-]\\d{2}:\\d{2}$/.test(value)) {
+      return value;
+    }
+    // Add Z if missing timezone
+    return value + 'Z';
+  }
+  
+  // Convert SQL datetime format to ISO 8601
+  // Format: "2025-12-09 09:38:26.778" -> "2025-12-09T09:38:26.778Z"
+  // Replace space with T
+  let isoValue = value.replace(' ', 'T');
+  
+  // Add Z if no timezone indicator present
+  if (!isoValue.includes('Z') && !/[+-]\\d{2}:\\d{2}$/.test(isoValue)) {
+    isoValue = isoValue + 'Z';
+  }
+  
+  return isoValue;
+}
 
 exports.handler = async (event) => {
   try {
@@ -1713,10 +2150,17 @@ exports.handler = async (event) => {
         
         const rows = athenaResults.ResultSet?.Rows || [];
         const headers = rows[0]?.Data?.map(col => col.VarCharValue) || [];
+        
         const data = rows.slice(1).map(row => {
           const obj = {};
           row.Data?.forEach((col, index) => {
-            obj[headers[index]] = col.VarCharValue;
+            const athenaColumnName = headers[index] || '';
+            // Map Athena column name (lowercase) to GraphQL field name (camelCase)
+            const graphQLFieldName = mapAthenaToGraphQL(athenaColumnName);
+            let value = col.VarCharValue;
+            // Convert datetime fields to ISO 8601 format
+            value = convertDateTime(value, graphQLFieldName);
+            obj[graphQLFieldName] = value;
           });
           return obj;
         });
@@ -1816,6 +2260,10 @@ exports.handler = async (event) => {
       finishDate = new Date().toISOString();
     }
     
+    // Reuse taskResult from earlier (already fetched at line 2301)
+    const task = unmarshall(taskResult.Item);
+    const taskType = task.taskType || null;
+    
     // Update task entity
     const updateExpression = 'SET taskStatus = :status, finishDate = :finishDate, updatedAt = :updatedAt';
     const expressionAttributeValues = {
@@ -1836,9 +2284,355 @@ exports.handler = async (event) => {
     
     console.log(\`Successfully updated task \${executionId} with status \${taskStatus}\`);
     
+    // If this is a deletion task that succeeded, publish to deletion queue
+    if (taskType === 'deletionTask' && taskStatus === 'SUCCEEDED') {
+      const { SQSClient, SendMessageCommand } = require('@aws-sdk/client-sqs');
+      const sqsClient = new SQSClient({ region: process.env.AWS_REGION });
+      const DELETION_QUEUE_URL = process.env.DELETION_QUEUE_URL;
+      
+      if (DELETION_QUEUE_URL) {
+        try {
+          await sqsClient.send(new SendMessageCommand({
+            QueueUrl: DELETION_QUEUE_URL,
+            MessageBody: JSON.stringify({ executionId })
+          }));
+          console.log(\`Published deletion task \${executionId} to deletion queue\`);
+        } catch (error) {
+          console.error(\`Error publishing deletion task to queue:\`, error);
+          // Don't fail - task is already updated
+        }
+      } else {
+        console.warn('DELETION_QUEUE_URL not set, skipping queue publish');
+      }
+    }
+    
     return { statusCode: 200, body: 'Success' };
   } catch (error) {
     console.error('Error tracking Athena execution:', error);
+    throw error;
+  }
+};
+`;
+  }
+
+  private generateCascadeDeletionListener(): string {
+    return `
+const { DynamoDBClient, QueryCommand, DeleteItemCommand } = require('@aws-sdk/client-dynamodb');
+const { S3Client, DeleteObjectsCommand } = require('@aws-sdk/client-s3');
+const { unmarshall } = require('@aws-sdk/util-dynamodb');
+
+const dynamoClient = new DynamoDBClient({ region: process.env.AWS_REGION });
+const s3Client = new S3Client({ region: process.env.AWS_REGION });
+const TABLE_NAME = process.env.DYNAMODB_TABLE_NAME;
+const BUCKET_NAME = process.env.S3_BUCKET_NAME;
+
+exports.handler = async (event) => {
+  try {
+    console.log('Processing cascade deletion messages:', JSON.stringify(event, null, 2));
+    
+    for (const record of event.Records) {
+      try {
+        const messageBody = JSON.parse(record.body);
+        const { entityType, entityId } = messageBody;
+        
+        console.log(\`Processing cascade deletion for \${entityType}#\${entityId}\`);
+        
+        // Query all joinRelation items for this entity
+        // PK: joinRelation#entityType#entityId, SK starts with joinRelation#
+        const pk = \`joinRelation#\${entityType}#\${entityId}\`;
+        
+        const queryResult = await dynamoClient.send(new QueryCommand({
+          TableName: TABLE_NAME,
+          KeyConditionExpression: 'PK = :pk AND begins_with(SK, :skPrefix)',
+          ExpressionAttributeValues: {
+            ':pk': { S: pk },
+            ':skPrefix': { S: 'joinRelation#' }
+          }
+        }));
+        
+        if (!queryResult.Items || queryResult.Items.length === 0) {
+          console.log(\`No join relations found for \${entityType}#\${entityId}\`);
+          continue;
+        }
+        
+        console.log(\`Found \${queryResult.Items.length} join relations to delete\`);
+        
+        // Collect unique relationIds and S3 keys
+        const relationIds = new Set();
+        const s3KeysToDelete = new Set();
+        const joinRelationItems = [];
+        
+        for (const item of queryResult.Items) {
+          const unmarshalled = unmarshall(item);
+          joinRelationItems.push(unmarshalled);
+          
+          if (unmarshalled.relationId) {
+            relationIds.add(unmarshalled.relationId);
+          }
+          
+          if (unmarshalled.s3Key) {
+            s3KeysToDelete.add(unmarshalled.s3Key);
+          }
+        }
+        
+        // For each relationId, query GSI1 to find all related joinRelation items
+        const { QueryCommand: GSI1QueryCommand } = require('@aws-sdk/client-dynamodb');
+        
+        for (const relationId of relationIds) {
+          try {
+            // Query GSI1 to get all items with this relationId
+            // Use ExpressionAttributeNames for GSI1-PK since it contains a hyphen
+            const gsi1Result = await dynamoClient.send(new GSI1QueryCommand({
+              TableName: TABLE_NAME,
+              IndexName: 'GSI1',
+              KeyConditionExpression: '#gsi1Pk = :gsi1Pk',
+              ExpressionAttributeNames: {
+                '#gsi1Pk': 'GSI1-PK'
+              },
+              ExpressionAttributeValues: {
+                ':gsi1Pk': { S: \`joinRelation#\${relationId}\` }
+              }
+            }));
+            
+            // Add all related items to deletion list
+            if (gsi1Result.Items) {
+              for (const item of gsi1Result.Items) {
+                const relatedItem = unmarshall(item);
+                if (!joinRelationItems.find(item => item.PK === relatedItem.PK && item.SK === relatedItem.SK)) {
+                  joinRelationItems.push(relatedItem);
+                  if (relatedItem.s3Key) {
+                    s3KeysToDelete.add(relatedItem.s3Key);
+                  }
+                }
+              }
+            }
+          } catch (error) {
+            console.error(\`Error querying GSI1 for relationId \${relationId}:\`, error);
+            // Continue with other relationIds
+          }
+        }
+        
+        // Bulk delete S3 objects (max 1000 per request)
+        if (s3KeysToDelete.size > 0) {
+          const s3KeysArray = Array.from(s3KeysToDelete).map(key => ({ Key: key }));
+          const chunks = [];
+          for (let i = 0; i < s3KeysArray.length; i += 1000) {
+            chunks.push(s3KeysArray.slice(i, i + 1000));
+          }
+          
+          for (const chunk of chunks) {
+            try {
+              await s3Client.send(new DeleteObjectsCommand({
+                Bucket: BUCKET_NAME,
+                Delete: {
+                  Objects: chunk,
+                  Quiet: false
+                }
+              }));
+              console.log(\`Deleted \${chunk.length} S3 objects\`);
+            } catch (error) {
+              console.error(\`Error deleting S3 objects:\`, error);
+              // Continue with other chunks
+            }
+          }
+        }
+        
+        // Delete all joinRelation items from DynamoDB
+        for (const item of joinRelationItems) {
+          try {
+            await dynamoClient.send(new DeleteItemCommand({
+              TableName: TABLE_NAME,
+              Key: {
+                PK: { S: item.PK },
+                SK: { S: item.SK }
+              }
+            }));
+            console.log(\`Deleted joinRelation item: \${item.PK}#\${item.SK}\`);
+          } catch (error) {
+            console.error(\`Error deleting joinRelation item:\`, error);
+            // Continue with other items
+          }
+        }
+        
+        // Delete all joinTableData items for the collected relationIds
+        for (const relationId of relationIds) {
+          try {
+            await dynamoClient.send(new DeleteItemCommand({
+              TableName: TABLE_NAME,
+              Key: {
+                PK: { S: \`joinTableData#\${relationId}\` },
+                SK: { S: \`joinTableData#\${relationId}\` }
+              }
+            }));
+            console.log(\`Deleted joinTableData item: joinTableData#\${relationId}\`);
+          } catch (error) {
+            // Item might not exist (already deleted or never created), log but continue
+            console.log(\`joinTableData item joinTableData#\${relationId} not found or already deleted\`);
+          }
+        }
+        
+        console.log(\`Successfully processed cascade deletion for \${entityType}#\${entityId}\`);
+      } catch (error) {
+        console.error('Error processing cascade deletion message:', error);
+        // Continue with other messages
+      }
+    }
+    
+    return { statusCode: 200, body: 'Cascade deletion completed' };
+  } catch (error) {
+    console.error('Error in cascade deletion listener:', error);
+    throw error;
+  }
+};
+`;
+  }
+
+  private generateDeletionListener(): string {
+    return `
+const { AthenaClient, GetQueryResultsCommand } = require('@aws-sdk/client-athena');
+const { S3Client, DeleteObjectsCommand } = require('@aws-sdk/client-s3');
+const { DynamoDBClient, QueryCommand, DeleteItemCommand } = require('@aws-sdk/client-dynamodb');
+
+const athenaClient = new AthenaClient({ region: process.env.AWS_REGION });
+const s3Client = new S3Client({ region: process.env.AWS_REGION });
+const dynamoClient = new DynamoDBClient({ region: process.env.AWS_REGION });
+const BUCKET_NAME = process.env.S3_BUCKET_NAME;
+const TABLE_NAME = process.env.DYNAMODB_TABLE_NAME;
+
+exports.handler = async (event) => {
+  try {
+    console.log('Processing deletion messages:', JSON.stringify(event, null, 2));
+    
+    for (const record of event.Records) {
+      try {
+        const messageBody = JSON.parse(record.body);
+        const { executionId } = messageBody;
+        
+        console.log(\`Processing deletion for execution \${executionId}\`);
+        
+        // Get query results from Athena
+        let nextToken = null;
+        const deletionItems = []; // Array of { s3Key, relationId }
+        
+        do {
+          const resultParams = {
+            QueryExecutionId: executionId,
+            MaxResults: 1000
+          };
+          
+          if (nextToken) {
+            resultParams.NextToken = nextToken;
+          }
+          
+          const result = await athenaClient.send(new GetQueryResultsCommand(resultParams));
+          
+          // Parse results - first row is headers
+          const rows = result.ResultSet?.Rows || [];
+          if (rows.length > 0) {
+            // Get column indices for s3Key and relationId
+            const headers = rows[0].Data?.map(col => col.VarCharValue) || [];
+            const s3KeyIndex = headers.findIndex(h => h && h.toLowerCase() === 's3key');
+            const relationIdIndex = headers.findIndex(h => h && h.toLowerCase() === 'relationid');
+            
+            if (s3KeyIndex === -1) {
+              throw new Error('s3Key column not found in query results');
+            }
+            
+            if (relationIdIndex === -1) {
+              throw new Error('relationId column not found in query results');
+            }
+            
+            // Extract s3Key and relationId values from data rows
+            for (let i = 1; i < rows.length; i++) {
+              const row = rows[i];
+              const s3KeyValue = row.Data?.[s3KeyIndex]?.VarCharValue;
+              const relationIdValue = row.Data?.[relationIdIndex]?.VarCharValue;
+              
+              if (s3KeyValue && relationIdValue) {
+                deletionItems.push({ s3Key: s3KeyValue, relationId: relationIdValue });
+              }
+            }
+          }
+          
+          nextToken = result.NextToken;
+        } while (nextToken);
+        
+        console.log(\`Found \${deletionItems.length} items to delete\`);
+        
+        // Process each deletion item
+        for (const item of deletionItems) {
+          try {
+            // 1. Delete joinTableData#{relationId} item
+            console.log(\`Deleting joinTableData#\${item.relationId}\`);
+            await dynamoClient.send(new DeleteItemCommand({
+              TableName: TABLE_NAME,
+              Key: {
+                PK: { S: \`joinTableData#\${item.relationId}\` },
+                SK: { S: \`joinTableData#\${item.relationId}\` }
+              }
+            }));
+            
+            // 2. Query GSI1 to find all joinRelation items for this relationId
+            // GSI1-PK: joinRelation#{relationId}
+            const gsi1QueryResult = await dynamoClient.send(new QueryCommand({
+              TableName: TABLE_NAME,
+              IndexName: 'GSI1',
+              KeyConditionExpression: '#gsi1Pk = :gsi1Pk',
+              ExpressionAttributeNames: {
+                '#gsi1Pk': 'GSI1-PK'
+              },
+              ExpressionAttributeValues: {
+                ':gsi1Pk': { S: \`joinRelation#\${item.relationId}\` }
+              }
+            }));
+            
+            // 3. Delete all joinRelation items found
+            if (gsi1QueryResult.Items && gsi1QueryResult.Items.length > 0) {
+              console.log(\`Found \${gsi1QueryResult.Items.length} joinRelation items to delete for relationId \${item.relationId}\`);
+              
+              for (const joinRelationItem of gsi1QueryResult.Items) {
+                const pk = joinRelationItem.PK?.S;
+                const sk = joinRelationItem.SK?.S;
+                
+                if (pk && sk) {
+                  await dynamoClient.send(new DeleteItemCommand({
+                    TableName: TABLE_NAME,
+                    Key: {
+                      PK: { S: pk },
+                      SK: { S: sk }
+                    }
+                  }));
+                }
+              }
+            }
+            
+            // 4. Delete S3 Parquet file
+            console.log(\`Deleting S3 object: \${item.s3Key}\`);
+            await s3Client.send(new DeleteObjectsCommand({
+              Bucket: BUCKET_NAME,
+              Delete: {
+                Objects: [{ Key: item.s3Key }],
+                Quiet: false
+              }
+            }));
+            
+            console.log(\`Successfully deleted item with relationId \${item.relationId}\`);
+          } catch (error) {
+            console.error(\`Error deleting item with relationId \${item.relationId}:\`, error);
+            // Continue with other items
+          }
+        }
+        
+        console.log(\`Successfully processed deletion for execution \${executionId}\`);
+      } catch (error) {
+        console.error('Error processing deletion message:', error);
+        // Continue with other messages
+      }
+    }
+    
+    return { statusCode: 200, body: 'Deletion processing completed' };
+  } catch (error) {
+    console.error('Error in deletion listener:', error);
     throw error;
   }
 };

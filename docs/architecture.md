@@ -148,7 +148,7 @@ Regular Entities:
 PK: "entity#id", SK: "entity#id"
 Example: PK: "user#123", SK: "user#123"
 
-Virtual Tables (Relationships):
+Join Tables (Relationships):
 PK: "relation#table#entity1#id", SK: "relation#table#entity2#id"
 Example: PK: "relation#user_posts#user#123", SK: "relation#user_posts#post#456"
 ```
@@ -167,7 +167,7 @@ s3://{project}-{account-id}/
 │   ├── post/
 │   │   └── year=2024/month=12/day=15/
 │   │       └── post-789.parquet
-│   └── user_posts/  # Virtual table
+│   └── user_posts/  # Join table
 │       └── year=2024/month=12/day=15/
 │           └── user_123_post_456.parquet
 └── athena-results/

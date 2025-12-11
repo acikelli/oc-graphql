@@ -14,10 +14,6 @@ export interface SqlQueryDirective {
   query: string;
 }
 
-export interface ResolverDirective {
-  enabled: boolean;
-}
-
 export interface ReturnDirective {
   value: string;
 }
@@ -43,7 +39,6 @@ export interface FieldMetadata {
 export interface TypeMetadata {
   name: string;
   fields: FieldMetadata[];
-  isResolver?: boolean;
   isPrimitive: boolean;
   isTaskResponse?: boolean;
 }
@@ -53,14 +48,93 @@ export interface SchemaMetadata {
   queries: FieldMetadata[];
   mutations: FieldMetadata[];
   enums: string[];
-  virtualTables: string[];
+  joinTables: string[];
+}
+
+/**
+ * Pre-processes schema to add missing return types for mutations
+ * INSERT mutations -> Boolean!
+ * DELETE mutations -> Boolean! (placeholder, will be removed later)
+ */
+function preprocessSchema(schemaString: string): string {
+  // Find Mutation type block - match everything between { and }
+  const mutationTypePattern = /(type\s+Mutation\s*{)([\s\S]*?)(^})/m;
+  const mutationMatch = schemaString.match(mutationTypePattern);
+
+  if (!mutationMatch) {
+    return schemaString; // No Mutation type found
+  }
+
+  const mutationFields = mutationMatch[2];
+  const lines = mutationFields.split("\n");
+  const processedLines: string[] = [];
+
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    const trimmedLine = line.trim();
+
+    // Check if this line is a field definition without return type
+    // Pattern: fieldName(args) followed by optional whitespace (no colon before @sql_query)
+    const fieldDefMatch = trimmedLine.match(/^(\w+)\s*\(([^)]*)\)\s*$/);
+
+    if (fieldDefMatch) {
+      const fieldName = fieldDefMatch[1];
+      const args = fieldDefMatch[2];
+
+      // Look ahead to find @sql_query directive (may be on next lines)
+      let sqlQuery = "";
+      let foundDirective = false;
+      for (let j = i + 1; j < lines.length && j < i + 10; j++) {
+        const nextLine = lines[j];
+        // Match @sql_query with query parameter - handle both single and multi-line
+        const sqlQueryMatch =
+          nextLine.match(/@sql_query\s*\(\s*query:\s*"([^"]+)"/) ||
+          nextLine.match(/query:\s*"([^"]+)"/);
+        if (sqlQueryMatch) {
+          sqlQuery = sqlQueryMatch[1].trim().toUpperCase();
+          foundDirective = true;
+          break;
+        }
+        // Stop if we hit another field definition
+        if (nextLine.trim().match(/^\w+\s*\(/)) {
+          break;
+        }
+      }
+
+      if (foundDirective && sqlQuery) {
+        let returnType: string;
+        if (sqlQuery.startsWith("DELETE")) {
+          returnType = "Boolean!"; // Placeholder for DELETE (will be removed from schema)
+        } else if (sqlQuery.startsWith("INSERT")) {
+          returnType = "Boolean!";
+        } else {
+          // Keep original line if we can't auto-infer
+          processedLines.push(line);
+          continue;
+        }
+
+        // Replace the line with field definition including return type
+        const indent = line.match(/^(\s*)/)?.[1] || "";
+        processedLines.push(`${indent}${fieldName}(${args}): ${returnType}`);
+        continue;
+      }
+    }
+
+    processedLines.push(line);
+  }
+
+  // Reconstruct the Mutation type
+  const processedFields = processedLines.join("\n");
+  return schemaString.replace(mutationTypePattern, `$1${processedFields}$3`);
 }
 
 export class SchemaParser {
   private document: DocumentNode;
 
   constructor(private schema: string) {
-    this.document = parse(schema);
+    // Pre-process schema to add missing return types before parsing
+    const preprocessedSchema = preprocessSchema(schema);
+    this.document = parse(preprocessedSchema);
   }
 
   parse(): SchemaMetadata {
@@ -68,7 +142,7 @@ export class SchemaParser {
     const queries: FieldMetadata[] = [];
     const mutations: FieldMetadata[] = [];
     const enums: string[] = [];
-    const virtualTables = new Set<string>();
+    const joinTables = new Set<string>();
 
     for (const definition of this.document.definitions) {
       if (definition.kind === "ObjectTypeDefinition") {
@@ -76,14 +150,14 @@ export class SchemaParser {
 
         if (typeDef.name.value === "Query") {
           queries.push(
-            ...this.parseFields(typeDef.fields || [], virtualTables)
+            ...this.parseFields(typeDef.fields || [], joinTables, true)
           );
         } else if (typeDef.name.value === "Mutation") {
           mutations.push(
-            ...this.parseFields(typeDef.fields || [], virtualTables)
+            ...this.parseFields(typeDef.fields || [], joinTables, false)
           );
         } else {
-          types.push(this.parseType(typeDef, virtualTables));
+          types.push(this.parseType(typeDef, joinTables));
         }
       } else if (definition.kind === "EnumTypeDefinition") {
         const enumDef = definition as EnumTypeDefinitionNode;
@@ -96,22 +170,23 @@ export class SchemaParser {
       queries,
       mutations,
       enums,
-      virtualTables: Array.from(virtualTables),
+      joinTables: Array.from(joinTables),
     };
   }
 
   private parseType(
     typeDef: ObjectTypeDefinitionNode,
-    virtualTables: Set<string>
+    joinTables: Set<string>
   ): TypeMetadata {
-    const isResolver = this.hasDirective("resolver", typeDef.directives);
-    const isTaskResponse = this.hasDirective("task_response", typeDef.directives);
+    const isTaskResponse = this.hasDirective(
+      "task_response",
+      typeDef.directives
+    );
     const isPrimitive = this.isPrimitiveType(typeDef.name.value);
 
     return {
       name: typeDef.name.value,
-      fields: this.parseFields(typeDef.fields || [], virtualTables),
-      isResolver,
+      fields: this.parseFields(typeDef.fields || [], joinTables),
       isPrimitive,
       isTaskResponse,
     };
@@ -119,18 +194,25 @@ export class SchemaParser {
 
   private parseFields(
     fields: readonly FieldDefinitionNode[],
-    virtualTables: Set<string>
+    joinTables: Set<string>,
+    isQueryType: boolean = false
   ): FieldMetadata[] {
     return fields.map((field) => {
       const fieldType = this.extractFieldType(field.type);
+      // Only extract sqlQuery for Query/Mutation fields (not type fields)
+      // This is determined by the caller context, but we'll extract it here
+      // and filter it out later in code generation
       const sqlQuery = this.extractSqlQueryDirective(field.directives);
       const returnValue = this.extractReturnDirective(field.directives);
       const fieldArguments = this.extractFieldArguments(field.arguments);
-      const isTask = this.hasDirective("task", field.directives);
+      // All Query fields are automatically tasks (no @task directive needed)
+      const isTask = isQueryType;
 
-      // Extract virtual tables from SQL queries
+      // Extract join tables from SQL queries (only from Query/Mutation fields)
+      // Note: We still extract here to catch join tables, but sqlQuery on type fields
+      // will be ignored during code generation
       if (sqlQuery?.query) {
-        this.extractVirtualTablesFromQuery(sqlQuery.query, virtualTables);
+        this.extractJoinTablesFromQuery(sqlQuery.query, joinTables);
       }
 
       return {
@@ -200,15 +282,15 @@ export class SchemaParser {
     };
   }
 
-  private extractVirtualTablesFromQuery(
+  private extractJoinTablesFromQuery(
     query: string,
-    virtualTables: Set<string>
+    joinTables: Set<string>
   ): void {
-    const virtualTableRegex = /\$virtual_table\(([^)]+)\)/g;
+    const joinTableRegex = /\$join_table\(([^)]+)\)/g;
     let match;
 
-    while ((match = virtualTableRegex.exec(query)) !== null) {
-      virtualTables.add(match[1]);
+    while ((match = joinTableRegex.exec(query)) !== null) {
+      joinTables.add(match[1]);
     }
   }
 
@@ -273,4 +355,3 @@ export class SchemaParser {
     return primitiveTypes.includes(typeName);
   }
 }
- 
