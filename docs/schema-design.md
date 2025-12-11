@@ -16,11 +16,13 @@ OC-GraphQL extends GraphQL with powerful custom directives that enable automatic
 
 ### 1. `@sql_query` - Direct SQL Integration
 
-Execute SQL queries directly within GraphQL resolvers.
+Execute SQL queries directly within GraphQL resolvers. **Can only be used on Query and Mutation fields**, not on type fields.
 
 ```graphql
 directive @sql_query(query: String!) on FIELD_DEFINITION
 ```
+
+**Important:** `@sql_query` directive can only be applied to fields in the `Query` and `Mutation` root types. It cannot be used on fields in regular type definitions.
 
 #### Automatic Return Type Generation
 
@@ -108,90 +110,23 @@ type Query {
 }
 ```
 
-### 2. `@resolver` - Custom Resolver Types
+### 2. Automatic Task Execution for Query Fields
 
-Define types that are resolved through custom SQL logic rather than DynamoDB.
-
-```graphql
-directive @resolver on OBJECT
-```
-
-#### Usage Examples
-
-##### Connection/Pagination Types
+All `Query` fields are automatically executed as asynchronous tasks to handle long-running queries that may exceed AppSync's 30-second timeout.
 
 ```graphql
-type UserPostConnection @resolver {
-  items: [Post!]!
-    @sql_query(
-      query: """
-      SELECT * FROM post
-      WHERE user_id = $source.id
-      ORDER BY created_at DESC
-      LIMIT $args.limit
-      OFFSET $args.offset
-      """
-    )
-
-  totalCount: Int!
-    @sql_query(
-      query: """
-      SELECT COUNT(*) as count FROM post WHERE user_id = $source.id
-      """
-    )
-
-  hasMore: Boolean! @return(value: "$args.offset + $args.limit < totalCount")
-}
-```
-
-##### Analytics Aggregation Types
-
-```graphql
-type UserAnalytics @resolver {
-  totalPosts: Int!
-    @sql_query(
-      query: "SELECT COUNT(*) as count FROM post WHERE user_id = $source.id"
-    )
-
-  totalLikes: Int!
-    @sql_query(
-      query: """
-      SELECT COUNT(*) as count FROM post_likes pl
-      JOIN post p ON pl.post_id = p.id
-      WHERE p.user_id = $source.id
-      """
-    )
-
-  avgPostLength: Float!
-    @sql_query(
-      query: """
-      SELECT AVG(LENGTH(content)) as avg_length
-      FROM post WHERE user_id = $source.id
-      """
-    )
-
-  joinedDate: String! @return(value: "$source.createdAt")
-}
-```
-
-### 3. `@task` - Long-Running Query Tasks
-
-Handle queries that may exceed AppSync's 30-second timeout by executing them asynchronously.
-
-```graphql
-directive @task on FIELD_DEFINITION
 directive @task_response on OBJECT
 ```
 
 #### Requirements
 
-- `@task` can **only** be used on `Query` fields (not `Mutation`)
+- All `Query` fields are automatically tasks (no `@task` directive needed)
 - The return type **must** have the `@task_response` directive
 - Types with `@task_response` do **not** generate CRUD operations (they only serve as response types)
 
 #### Usage
 
-When applied to a query with `@sql_query`, the framework automatically generates:
+For any `Query` field with `@sql_query`, the framework automatically generates:
 
 - **Mutation**: `triggerTask<QueryName>` - Starts the task and returns a `taskId` (which is the Athena execution ID)
 - **Query**: `taskResult<QueryName>` - Polls task status and retrieves results
@@ -224,7 +159,6 @@ type Query {
       ORDER BY month
       """
     )
-    @task
 }
 
 # Response type must have @task_response directive
@@ -330,13 +264,13 @@ This ensures reliable task tracking even without EventBridge configuration.
 
 #### Best Practices
 
-1. **Use for Long-Running Queries**: Only apply `@task` to queries that may exceed 30 seconds
+1. **Automatic Task Execution**: All `Query` fields are automatically executed as tasks
 2. **Response Type Validation**: Always mark response types with `@task_response` directive
 3. **Polling Strategy**: Implement exponential backoff when polling `taskResult` queries
 4. **Error Handling**: Check `taskStatus` for `FAILED` and handle errors appropriately
 5. **Result Nullability**: The `result` field is nullable - check `taskStatus` before accessing results
 
-### 4. DELETE SQL Operations - Asynchronous Deletion Tasks
+### 3. DELETE SQL Operations - Asynchronous Deletion Tasks
 
 Since Athena doesn't support DELETE operations directly, DELETE SQL statements are automatically transformed into SELECT queries that return `s3Key` values, then processed asynchronously as deletion tasks.
 
@@ -530,14 +464,13 @@ Deletion tasks are stored in DynamoDB with:
 5. **Cascade Deletion**: For entity deletions with related data, use cascade deletion instead
 
 ```graphql
-# Good: Long-running analytics query with @task_response type
+# Good: Query field automatically executed as task with @task_response type
 type Query {
   analyzeCustomerBehavior(
     startDate: AWSDateTime!
     endDate: AWSDateTime!
   ): [AnalysisResult!]!
     @sql_query(query: "SELECT ... complex multi-table join ...")
-    @task
 }
 
 type AnalysisResult @task_response {
@@ -546,60 +479,17 @@ type AnalysisResult @task_response {
   averageOrderValue: Float!
 }
 
-# Avoid: Fast queries don't need @task
+# Note: All Query fields are automatically tasks, no directive needed
 type Query {
   getUser(id: ID!): User
     @sql_query(query: "SELECT * FROM user WHERE id = $args.id")
-  # No @task needed - completes in < 1 second
-}
-
-# Error: @task cannot be used on Mutation
-type Mutation {
-  createReport(input: ReportInput!): Report!
-    @sql_query(query: "INSERT INTO ...")
-    @task # ❌ Invalid - @task only works on Query fields
+  # Automatically executed as task, but response type must have @task_response
 }
 ```
 
 ### 4. `@return` - Static Value Returns
 
-Return computed or static values without database queries.
-
-```graphql
-directive @return(value: String!) on FIELD_DEFINITION
-```
-
-#### Usage Examples
-
-##### Computed Values
-
-```graphql
-type UserPostConnection @resolver {
-  # Calculate pagination metadata
-  pageInfo: PageInfo!
-    @return(value: "{hasNextPage: $args.offset + $args.limit < totalCount}")
-
-  # Return request parameters
-  currentOffset: Int! @return(value: "$args.offset")
-  currentLimit: Int! @return(value: "$args.limit")
-
-  # Static metadata
-  queryTimestamp: String! @return(value: "new Date().toISOString()")
-}
-```
-
-##### Parameter Passthrough
-
-```graphql
-type SearchResult @resolver {
-  results: [Post!]!
-    @sql_query(query: "SELECT * FROM post WHERE title ILIKE '%$args.query%'")
-
-  # Return search parameters
-  searchQuery: String! @return(value: "$args.query")
-  searchFilters: String! @return(value: "$args.filters")
-}
-```
+**Note:** `@return` directive is deprecated. It was previously used with `@resolver` types, which are no longer supported. Use `@sql_query` on Query/Mutation fields instead.
 
 ## 🏗️ Schema Structure Patterns
 
@@ -616,104 +506,10 @@ type User {
   city: String
   createdAt: AWSDateTime!
   updatedAt: AWSDateTime!
-
-  # Field-level SQL queries (resolved via Lambda)
-  totalPosts: Int!
-    @sql_query(
-      query: "SELECT COUNT(*) as count FROM post WHERE user_id = $source.id"
-    )
-
-  # Relationship to resolver type
-  posts(limit: Int = 10, offset: Int = 0): UserPostConnection!
-  analytics: UserAnalytics!
-}
-
-type Post {
-  id: ID!
-  title: String!
-  content: String!
-  userId: ID!
-  published: Boolean!
-  createdAt: AWSDateTime!
-  updatedAt: AWSDateTime!
-
-  # Field-level analytics
-  likeCount: Int!
-    @sql_query(
-      query: "SELECT COUNT(*) as count FROM post_likes WHERE post_id = $source.id"
-    )
-  commentCount: Int!
-    @sql_query(
-      query: "SELECT COUNT(*) as count FROM comment WHERE post_id = $source.id"
-    )
 }
 ```
 
-### Resolver Types (Custom Logic)
-
-Types resolved through SQL queries rather than DynamoDB lookups.
-
-```graphql
-type UserPostConnection @resolver {
-  items: [Post!]!
-    @sql_query(
-      query: """
-      SELECT * FROM post
-      WHERE user_id = $source.id
-      AND ($args.published IS NULL OR published = $args.published)
-      ORDER BY created_at DESC
-      LIMIT $args.limit OFFSET $args.offset
-      """
-    )
-
-  totalCount: Int!
-    @sql_query(
-      query: """
-      SELECT COUNT(*) as count FROM post
-      WHERE user_id = $source.id
-      AND ($args.published IS NULL OR published = $args.published)
-      """
-    )
-
-  pageInfo: PageInfo!
-    @return(value: "{hasNextPage: $args.offset + $args.limit < totalCount}")
-}
-
-type PostAnalytics @resolver {
-  viewCount: Int!
-    @sql_query(
-      query: "SELECT view_count FROM post_views WHERE post_id = $source.id"
-    )
-
-  topCommenters: [User!]!
-    @sql_query(
-      query: """
-      SELECT DISTINCT u.* FROM user u
-      JOIN comment c ON u.id = c.user_id
-      WHERE c.post_id = $source.id
-      ORDER BY u.name
-      LIMIT 5
-      """
-    )
-
-  engagementScore: Float!
-    @sql_query(
-      query: """
-      SELECT (
-        COUNT(DISTINCT l.id) * 2 +
-        COUNT(DISTINCT c.id) * 3 +
-        COUNT(DISTINCT s.id) * 5
-      ) / GREATEST(EXTRACT(days FROM NOW() - p.created_at), 1) as score
-      FROM post p
-      LEFT JOIN post_likes l ON p.id = l.post_id
-      LEFT JOIN comment c ON p.id = c.post_id
-      LEFT JOIN post_shares s ON p.id = s.post_id
-      WHERE p.id = $source.id
-      GROUP BY p.id, p.created_at
-      """
-    )
-}
-```
+**Note:** `@sql_query` can only be used on Query and Mutation fields, not on type fields. For analytics queries, define them as Query fields instead.
 
 ## 🔗 Join Tables (Many-to-Many Relationships)
 

@@ -2,9 +2,12 @@ scalar AWSDateTime
 
 type Query {
   getUsersByCity(city: String!): [UserTaskResponse]
-    @task
     @sql_query(
-      query: "SELECT * FROM user u JOIN address a ON u.id = a.userId WHERE a.city = $args.city"
+      query: "SELECT u.*, COUNT(*) OVER() AS total FROM user u JOIN address a ON u.id = a.userId WHERE a.city = $args.city"
+    )
+  getUserFavoriteProducts(userId: String!): [ProductTaskResponse]
+    @sql_query(
+      query: "SELECT * FROM product p JOIN user_favorite_products ufp ON p.id = ufp.productId WHERE ufp.userId = $args.userId"
     )
 }
 
@@ -13,9 +16,13 @@ type Mutation {
     @sql_query(
       query: "INSERT INTO $join_table(user_favorite_products) (userId:User, productId:Product) VALUES ($args.userId, $args.productId)"
     )
-  removeBrandFromFavorites(productId: ID!)
+  removeProductFromFavorite(productId: ID!)
     @sql_query(
       query: "DELETE ufp FROM user_favorite_products ufp WHERE ufp.productId = $args.productId;"
+    )
+  removeBrandFromFavorites(brandId: ID!)
+    @sql_query(
+      query: "DELETE ufp FROM user_favorite_products ufp INNER JOIN product p ON ufp.productId = p.id WHERE p.brandId = $args.brandId;"
     )
 }
 
@@ -26,23 +33,13 @@ type UserTaskResponse @task_response {
   password: String!
   createdAt: AWSDateTime!
   updatedAt: AWSDateTime!
-}
+  total: Int!
+} 
 
-type UserFavoriteProductConnection @resolver {
-  items: [Product!]!
-    @sql_query(
-      query: "SELECT * FROM product p JOIN user_favorite_products ufp ON p.id = ufp.productId where ufp.userId = $source.id OFFSET $args.offset LIMIT $args.limit "
-    )
-  limit: Int! @return(value: "$args.limit")
-  offset: Int! @return(value: "$args.offset")
-  total: Int! @sql_query(query: "SELECT COUNT(*) as total FROM product")
-}
 
 type Address {
   id: ID!
   userId: ID!
-  user: User!
-    @sql_query(query: "SELECT * FROM user u WHERE u.id = $source.userId")
   city: String!
   state: String!
   zip: String!
@@ -56,6 +53,15 @@ type Address {
 type Brand {
   id: ID!
   name: String!
+  createdAt: AWSDateTime!
+  updatedAt: AWSDateTime!
+}
+
+type ProductTaskResponse @task_response {
+  id: ID!
+  name: String!
+  brandId: ID!
+  price: Float!
   createdAt: AWSDateTime!
   updatedAt: AWSDateTime!
 }
@@ -76,7 +82,4 @@ type User {
   password: String!
   createdAt: AWSDateTime!
   updatedAt: AWSDateTime!
-  addresses: [Address!]
-    @sql_query(query: "SELECT * FROM address a WHERE a.userId = $source.id ")
-  favoriteProducts(limit: Int, offset: Int): UserFavoriteProductConnection
 }

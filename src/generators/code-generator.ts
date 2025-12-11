@@ -20,7 +20,7 @@ export class CodeGenerator {
 
     // Generate CRUD functions for each type (skip @task_response types)
     for (const type of this.schemaMetadata.types) {
-      if (!type.isPrimitive && !type.isResolver && !type.isTaskResponse) {
+      if (!type.isPrimitive && !type.isTaskResponse) {
         lambdaFunctions[
           `ocg-${this.projectName}-create-${type.name.toLowerCase()}.js`
         ] = this.generateCreateFunction(type);
@@ -36,13 +36,8 @@ export class CodeGenerator {
       }
     }
 
-    // Generate resolver functions for @sql_query directives
-    for (const query of this.schemaMetadata.queries) {
-      if (query.sqlQuery) {
-        lambdaFunctions[`ocg-${this.projectName}-query-${query.name}.js`] =
-          this.generateSqlQueryFunction(query);
-      }
-    }
+    // Query fields are automatically tasks - no direct Lambda functions generated
+    // Users must use triggerTask... mutations and taskResult... queries instead
 
     for (const mutation of this.schemaMetadata.mutations) {
       if (mutation.sqlQuery) {
@@ -62,28 +57,6 @@ export class CodeGenerator {
           lambdaFunctions[
             `ocg-${this.projectName}-mutation-${mutation.name}.js`
           ] = this.generateSqlQueryFunction(mutation);
-        }
-      }
-    }
-
-    // Generate resolver functions for types with @resolver directive
-    for (const type of this.schemaMetadata.types) {
-      if (type.isResolver) {
-        lambdaFunctions[
-          `ocg-${this.projectName}-resolver-${type.name.toLowerCase()}.js`
-        ] = this.generateResolverFunction(type);
-      }
-    }
-
-    // Generate individual field resolvers for fields with @sql_query in regular types
-    for (const type of this.schemaMetadata.types) {
-      if (!type.isPrimitive && !type.isResolver) {
-        for (const field of type.fields) {
-          if (field.sqlQuery) {
-            lambdaFunctions[
-              `ocg-${this.projectName}-field-${type.name.toLowerCase()}-${field.name}.js`
-            ] = this.generateSqlQueryFunction(field);
-          }
         }
       }
     }
@@ -581,249 +554,7 @@ exports.handler = async (event) => {
 `;
   }
 
-  private generateResolverFunction(type: TypeMetadata): string {
-    const fieldsWithQueries = type.fields.filter((f) => f.sqlQuery);
-
-    return `
-const { AthenaClient, StartQueryExecutionCommand, GetQueryExecutionCommand, GetQueryResultsCommand } = require('@aws-sdk/client-athena');
-
-const athenaClient = new AthenaClient({ region: process.env.AWS_REGION });
-const DATABASE_NAME = process.env.ATHENA_DATABASE_NAME;
-const S3_OUTPUT_LOCATION = process.env.ATHENA_OUTPUT_LOCATION;
-
-// SQL injection prevention function
-function escapeSqlValue(value) {
-  if (value === null || value === undefined) {
-    return 'NULL';
-  } else if (typeof value === 'number') {
-    // Validate number to prevent injection via scientific notation or special values
-    if (!isFinite(value)) {
-      throw new Error('Invalid number value');
-    }
-    return value.toString();
-  } else if (typeof value === 'boolean') {
-    return value ? 'true' : 'false';
-  } else if (typeof value === 'string') {
-    // Escape for SQL while preserving user's search intent
-    let escaped = value.split("'").join("''"); // SQL standard: escape single quotes
-    // Note: We only escape quotes, not remove content, to preserve search terms
-    // Athena handles this safely when parameters are properly quoted
-    return "'" + escaped + "'";
-  } else {
-    throw new Error('Unsupported data type for SQL parameter');
-  }
-}
-
-exports.handler = async (event) => {
-  try {
-    const sourceArgs = event.source || {};
-    const fieldArgs = event.arguments || {};
-    
-    console.log('Resolver function called with:', { sourceArgs, fieldArgs });
-    
-    // Determine which field is being requested from the GraphQL info
-    const requestedField = event.info?.fieldName;
-    console.log('Requested field:', requestedField);
-    if (event.source.calculatedResponse) {
-      console.log('Returning from calculatedResponse:', requestedField);
-      return event.source.calculatedResponse[requestedField];
-    }
-    // Run all SQL queries in parallel
-    const queryPromises = [
-${fieldsWithQueries
-  .map((field) => {
-    // For list fields, return the entire result array
-    // For scalar fields, extract the value from the first row
-    // If the result has a field matching the field name, use that
-    // Otherwise, try _col0 or the first value in the object
-    const fieldType = this.schemaMetadata.types.find(
-      (t) => t.name === field.type
-    );
-    const isScalar = fieldType?.isPrimitive || false;
-
-    if (field.isList) {
-      return `
-      executeQuery(\`${field.sqlQuery!.query}\`, { ...sourceArgs, ...fieldArgs })
-        .then(result => ({ field: '${field.name}', result: result }))
-`;
-    } else {
-      // For scalar fields, extract the value from the first row
-      // Try field name first, then _col0, then first value in object
-      return `
-      executeQuery(\`${field.sqlQuery!.query}\`, { ...sourceArgs, ...fieldArgs })
-        .then(result => {
-          if (!result || result.length === 0) return { field: '${field.name}', result: null };
-          const firstRow = result[0];
-          let value = null;
-          
-          // Try to get value by field name (e.g., result[0].total for "total" field)
-          if (firstRow['${field.name}'] !== undefined) {
-            value = firstRow['${field.name}'];
-          } else if (firstRow['_col0'] !== undefined) {
-            // Fallback to _col0 (for queries like SELECT COUNT(*) without alias)
-            value = firstRow['_col0'];
-          } else {
-            // Fallback to first value in the object
-            const keys = Object.keys(firstRow);
-            if (keys.length > 0) {
-              value = firstRow[keys[0]];
-            }
-          }
-          
-          // Convert to appropriate type
-          ${
-            field.type === "Int"
-              ? `
-          if (value !== null && value !== undefined) {
-            const num = typeof value === 'string' ? parseInt(value, 10) : Number(value);
-            value = isNaN(num) ? null : num;
-          }`
-              : ""
-          }
-          ${
-            field.type === "Float"
-              ? `
-          if (value !== null && value !== undefined) {
-            const num = typeof value === 'string' ? parseFloat(value) : Number(value);
-            value = isNaN(num) ? null : num;
-          }`
-              : ""
-          }
-          ${
-            field.type === "Boolean"
-              ? `
-          if (value !== null && value !== undefined) {
-            if (typeof value === 'string') {
-              value = value.toLowerCase() === 'true' || value === '1';
-            } else {
-              value = Boolean(value);
-            }
-          }`
-              : ""
-          }
-          
-          return { field: '${field.name}', result: value };
-        })
-`;
-    }
-  })
-  .join(",\n")}
-    ];
-    
-    const results = await Promise.all(queryPromises);
-    
-    // Build response object
-    const response = {};
-    results.forEach(({ field, result }) => {
-      response[field] = result;
-    });
-    
-    // Handle @return directives - extract actual values from args or source
-    ${type.fields
-      .filter((f) => f.returnValue)
-      .map((f) => {
-        const returnValue = f.returnValue!.value;
-        if (returnValue.startsWith("$args.")) {
-          const argKey = returnValue.replace("$args.", "");
-          return `response.${f.name} = fieldArgs.${argKey};`;
-        } else if (returnValue.startsWith("$source.")) {
-          const sourceKey = returnValue.replace("$source.", "");
-          return `response.${f.name} = sourceArgs.${sourceKey};`;
-        } else {
-          // Static value
-          return `response.${f.name} = ${returnValue};`;
-        }
-      })
-      .join("\n    ")}
-    
-    console.log('Resolver response:', response);
-    
-    // Return only the requested field value, not the entire response object
-    if (requestedField && response.hasOwnProperty(requestedField)) {
-      console.log(\`Returning field '\${requestedField}':\`, response[requestedField]);
-      return response[requestedField];
-    }
-    
-    // Fallback: return entire response if field not found
-    console.log('Field not found, returning entire response');
-    return { calculatedResponse: response, event };
-  } catch (error) {
-    console.error('Error in resolver:', error);
-    throw error;
-  }
-};
-
-async function executeQuery(query, args) {
-  try {
-    console.log('Executing query with args:', { query, args });
-    
-    // Replace parameter placeholders with SQL-safe escaping
-    Object.entries(args).forEach(([key, value]) => {
-      const argsPattern = '$args.' + key;
-      const sourcePattern = '$source.' + key;
-      const sqlSafeValue = escapeSqlValue(value);
-      query = query.split(argsPattern).join(sqlSafeValue);
-      query = query.split(sourcePattern).join(sqlSafeValue);
-    });
-    
-    console.log('Query after parameter replacement:', query);
-    
-    // Replace join table references
-    query = query.replace(/\$join_table\(([^)]+)\)/g, '$1');
-    
-    // Execute Athena query
-    const queryExecution = await athenaClient.send(new StartQueryExecutionCommand({
-      QueryString: query,
-      QueryExecutionContext: {
-        Database: DATABASE_NAME
-      },
-      ResultConfiguration: {
-        OutputLocation: S3_OUTPUT_LOCATION
-      }
-    }));
-    
-    // Wait for query to complete
-    const queryExecutionId = queryExecution.QueryExecutionId;
-    let status = 'RUNNING';
-    
-    while (status === 'RUNNING' || status === 'QUEUED') {
-      await new Promise(resolve => setTimeout(resolve, 1000));
-      const result = await athenaClient.send(new GetQueryExecutionCommand({
-        QueryExecutionId: queryExecutionId
-      }));
-      console.log("Query execution result:", JSON.stringify(result, null, 2));
-      status = result.QueryExecution?.Status?.State || 'FAILED';
-    }
-    
-    if (status !== 'SUCCEEDED') {
-      throw new Error(\`Query failed with status: \${status}\`);
-    }
-    
-    // Get query results
-    const results = await athenaClient.send(new GetQueryResultsCommand({
-      QueryExecutionId: queryExecutionId
-    }));
-    
-    // Process results
-    const rows = results.ResultSet?.Rows || [];
-    const headers = rows[0]?.Data?.map(col => col.VarCharValue) || [];
-    const data = rows.slice(1).map(row => {
-      const obj = {};
-      row.Data?.forEach((col, index) => {
-        obj[headers[index]] = col.VarCharValue;
-      });
-      return obj;
-    });
-    
-    console.log('Query results:', data);
-    return data;
-  } catch (error) {
-    console.error('Error executing query:', error);
-    throw error;
-  }
-}
-`;
-  }
+  // Removed: generateResolverFunction - @resolver directive no longer supported
 
   private generateStreamProcessor(): string {
     const fs = require("fs");
@@ -856,6 +587,11 @@ glue_client = boto3.client('glue')
 sqs_client = boto3.client('sqs')
 
 BUCKET_NAME = os.environ['S3_BUCKET_NAME']
+
+# Cache for Glue table schema checks to prevent excessive API calls
+# Key: table_name, Value: (last_check_timestamp, known_columns_set, table_exists)
+_glue_table_cache = {}
+CACHE_TTL_SECONDS = 300  # Cache for 5 minutes to avoid excessive Glue/S3 API calls
 GLUE_DATABASE = os.environ['ATHENA_DATABASE_NAME']
 CASCADE_DELETION_QUEUE_URL = os.environ.get('CASCADE_DELETION_QUEUE_URL')
 
@@ -965,21 +701,26 @@ def handle_insert_update_operation(record, event_name, current_date, year, month
     if not entity_type:
         return
     
+    # Extract date from item's createdAt for partitioning (use createdAt date, not current date)
+    # This ensures updates go to the same partition as the original creation
+    item_date = parse_item_date(item.get('createdAt'), current_date)
+    item_year, item_month, item_day = format_date_parts(item_date)
+    
     # Add processing metadata
     item['_processing_timestamp'] = current_date.isoformat()
     item['_event_name'] = event_name
-    item['_partition_year'] = year
-    item['_partition_month'] = month
-    item['_partition_day'] = day
+    item['_partition_year'] = item_year
+    item['_partition_month'] = item_month
+    item['_partition_day'] = item_day
     
     # Check if this is a join table data item (joinTableData#relationId)
     if item.get('PK', '').startswith('joinTableData#'):
-        handle_join_table_data_item(item, year, month, day, event_name)
+        handle_join_table_data_item(item, item_year, item_month, item_day, event_name)
     elif item.get('joinTable'):
         # Legacy join table item (should not be created anymore, but handle for backwards compatibility)
-        handle_legacy_join_table_item(item, year, month, day, event_name)
+        handle_legacy_join_table_item(item, item_year, item_month, item_day, event_name)
     else:
-        handle_regular_entity_item(item, entity_type, year, month, day, event_name)
+        handle_regular_entity_item(item, entity_type, item_year, item_month, item_day, event_name)
 
 def handle_join_table_data_item(item, year, month, day, event_name):
     """Handle join table data items using relationId as filename"""
@@ -1201,13 +942,151 @@ def write_parquet_to_s3(df, s3_key):
 def ensure_optimized_glue_table(table_name, location, sample_item, df):
     """Create or update Glue table with Parquet format support"""
     try:
+        # Check cache first to avoid excessive Glue API calls
+        current_time = datetime.utcnow().timestamp()
+        cache_key = table_name
+        cached_entry = _glue_table_cache.get(cache_key)
+        
+        # Get current DataFrame columns (excluding partition and internal fields)
+        df_column_names_lower = set()
+        for column_name in df.columns:
+            if column_name.startswith('_partition_') or column_name in ['PK', 'SK', 'GSI1-PK', 'GSI1-SK', 'entityType', 'entityId']:
+                continue
+            df_column_names_lower.add(column_name.lower())
+        
+        # Check if we have a recent cache entry and if all DataFrame columns are already known
+        if cached_entry:
+            last_check_time, known_columns_lower, table_exists = cached_entry
+            time_since_check = current_time - last_check_time
+            
+            # If cache is still valid and all DataFrame columns are already known, skip Glue API call
+            if time_since_check < CACHE_TTL_SECONDS and df_column_names_lower.issubset(known_columns_lower) and table_exists:
+                logger.debug(f"Using cached schema for table '{table_name}', skipping Glue API call")
+                return
+        
         # Check if table exists (this is a lightweight Glue API call, not S3)
-        glue_client.get_table(DatabaseName=GLUE_DATABASE, Name=table_name)
-        logger.info(f"Table '{table_name}' already exists")
+        existing_table = glue_client.get_table(DatabaseName=GLUE_DATABASE, Name=table_name)
+        logger.info(f"Table '{table_name}' already exists, checking for new columns")
+        
+        # Get existing columns from Glue table and deduplicate (keep first occurrence)
+        # Use case-insensitive comparison to detect duplicates
+        existing_columns_list = existing_table['Table']['StorageDescriptor']['Columns']
+        seen_column_names = set()
+        seen_column_names_lower = set()  # For case-insensitive duplicate detection
+        deduplicated_existing_columns = []
+        for col in existing_columns_list:
+            col_name = col['Name']
+            col_name_lower = col_name.lower()
+            if col_name_lower not in seen_column_names_lower:
+                seen_column_names_lower.add(col_name_lower)
+                seen_column_names.add(col_name)
+                deduplicated_existing_columns.append(col)
+            else:
+                logger.warning(f"Found duplicate column '{col_name}' (case-insensitive match) in existing table '{table_name}', removing duplicate")
+        
+        # Create a lookup dictionary for quick case-insensitive checks
+        # Key: lowercase name, Value: original column definition
+        existing_columns_lower = {col['Name'].lower(): col for col in deduplicated_existing_columns}
+        existing_columns = {col['Name']: col for col in deduplicated_existing_columns}
+        
+        # Get columns from DataFrame (excluding partition columns and internal fields)
+        # Deduplicate DataFrame columns first (in case DataFrame has duplicates)
+        # Use case-insensitive comparison to catch duplicates with different casing
+        seen_df_columns = set()
+        seen_df_columns_lower = set()  # For case-insensitive duplicate detection
+        df_columns = {}
+        for column_name in df.columns:
+            if column_name.startswith('_partition_') or column_name in ['PK', 'SK', 'GSI1-PK', 'GSI1-SK', 'entityType', 'entityId']:
+                continue
+            
+            column_name_lower = column_name.lower()
+            # Skip if we've already seen this column name in DataFrame (case-insensitive)
+            if column_name_lower in seen_df_columns_lower:
+                logger.warning(f"Duplicate column '{column_name}' (case-insensitive match) found in DataFrame for table '{table_name}', skipping duplicate")
+                continue
+            
+            seen_df_columns_lower.add(column_name_lower)
+            seen_df_columns.add(column_name)
+            column_type = infer_glue_type_from_dataframe(df, column_name)
+            df_columns[column_name] = {
+                'Name': column_name,
+                'Type': column_type
+            }
+        
+        # Find new columns that don't exist in Glue table (case-insensitive check)
+        new_columns = []
+        for col_name, col_def in df_columns.items():
+            col_name_lower = col_name.lower()
+            if col_name_lower not in existing_columns_lower:
+                new_columns.append(col_def)
+                logger.info(f"Found new column '{col_name}' (type: {col_def['Type']}) to add to table '{table_name}'")
+            else:
+                # Column exists (case-insensitive match) - check if casing is different
+                existing_col = existing_columns_lower[col_name_lower]
+                if existing_col['Name'] != col_name:
+                    logger.info(f"Column '{col_name}' already exists as '{existing_col['Name']}' in table '{table_name}' (case-insensitive match), skipping")
+        
+        # Update table if new columns are found or if duplicates were removed
+        if new_columns or len(deduplicated_existing_columns) != len(existing_columns_list):
+            # Get existing table definition
+            table_input = existing_table['Table']
+            
+            # Combine deduplicated existing columns + new columns, then deduplicate again to be absolutely safe
+            # Use case-insensitive comparison for final deduplication
+            combined_columns = deduplicated_existing_columns + new_columns
+            final_seen = set()
+            final_seen_lower = set()  # For case-insensitive duplicate detection
+            updated_columns = []
+            for col in combined_columns:
+                col_name = col['Name']
+                col_name_lower = col_name.lower()
+                if col_name_lower not in final_seen_lower:
+                    final_seen_lower.add(col_name_lower)
+                    final_seen.add(col_name)
+                    updated_columns.append(col)
+                else:
+                    logger.warning(f"Duplicate column '{col_name}' (case-insensitive match) detected in final column list for table '{table_name}', removing duplicate")
+            
+            # Update the table with new columns
+            glue_client.update_table(
+                DatabaseName=GLUE_DATABASE,
+                TableInput={
+                    'Name': table_name,
+                    'Description': table_input.get('Description', ''),
+                    'PartitionKeys': table_input.get('PartitionKeys', []),
+                    'StorageDescriptor': {
+                        'Columns': updated_columns,
+                        'Location': table_input['StorageDescriptor']['Location'],
+                        'InputFormat': table_input['StorageDescriptor']['InputFormat'],
+                        'OutputFormat': table_input['StorageDescriptor']['OutputFormat'],
+                        'SerdeInfo': table_input['StorageDescriptor']['SerdeInfo'],
+                        'Parameters': table_input['StorageDescriptor'].get('Parameters', {})
+                    },
+                    'TableType': table_input.get('TableType', 'EXTERNAL_TABLE'),
+                    'Parameters': table_input.get('Parameters', {})
+                }
+            )
+            if new_columns:
+                logger.info(f"Successfully updated table '{table_name}' with {len(new_columns)} new columns: {[col['Name'] for col in new_columns]}")
+            if len(deduplicated_existing_columns) != len(existing_columns_list):
+                logger.info(f"Successfully removed {len(existing_columns_list) - len(deduplicated_existing_columns)} duplicate columns from table '{table_name}'")
+            
+            # Update cache with new columns after successful update
+            updated_columns_lower = {col['Name'].lower() for col in updated_columns}
+            _glue_table_cache[cache_key] = (current_time, updated_columns_lower, True)
+        else:
+            logger.info(f"Table '{table_name}' schema is up to date, no new columns to add")
+            # Update cache even when no changes are needed
+            existing_columns_lower_set = {col['Name'].lower() for col in deduplicated_existing_columns}
+            _glue_table_cache[cache_key] = (current_time, existing_columns_lower_set, True)
+        
         return
     except glue_client.exceptions.EntityNotFoundException:
         logger.info(f"Creating new Parquet table: {table_name}")
         create_parquet_glue_table(table_name, location, sample_item, df)
+        # Update cache after creating new table
+        df_column_names_lower_set = {col.lower() for col in df.columns if not col.startswith('_partition_') and col not in ['PK', 'SK', 'GSI1-PK', 'GSI1-SK', 'entityType', 'entityId']}
+        _glue_table_cache[cache_key] = (current_time, df_column_names_lower_set, True)
     except Exception as e:
         # Log error but don't fail - table might be created concurrently
         logger.warning(f"Error checking/creating Glue table '{table_name}': {e}")
@@ -1216,11 +1095,22 @@ def ensure_optimized_glue_table(table_name, location, sample_item, df):
 def create_parquet_glue_table(table_name, location, sample_item, df):
     """Create optimized Parquet Glue table using processed DataFrame types"""
     # Generate columns from DataFrame dtypes (more accurate than sample item)
+    # Deduplicate columns to prevent any duplicates (case-insensitive)
+    seen_column_names = set()
+    seen_column_names_lower = set()  # For case-insensitive duplicate detection
     columns = []
     for column_name in df.columns:
-        if column_name.startswith('_partition_'):
+        if column_name.startswith('_partition_') or column_name in ['PK', 'SK', 'GSI1-PK', 'GSI1-SK', 'entityType', 'entityId']:
             continue
-            
+        
+        column_name_lower = column_name.lower()
+        # Skip if we've already seen this column name (case-insensitive deduplicate)
+        if column_name_lower in seen_column_names_lower:
+            logger.warning(f"Duplicate column '{column_name}' (case-insensitive match) found in DataFrame for table '{table_name}', skipping duplicate")
+            continue
+        
+        seen_column_names_lower.add(column_name_lower)
+        seen_column_names.add(column_name)
         column_type = infer_glue_type_from_dataframe(df, column_name)
         columns.append({
             'Name': column_name,
@@ -1427,7 +1317,7 @@ def send_cascade_deletion_message(entity_type, entity_id):
 
     // Generate CreateXInput type
     for (const type of this.schemaMetadata.types) {
-      if (!type.isPrimitive && !type.isResolver) {
+      if (!type.isPrimitive && !type.isTaskResponse) {
         const createFields = type.fields
           .filter(
             (field) =>
@@ -1490,66 +1380,30 @@ def send_cascade_deletion_message(entity_type, entity_id):
   }
 
   private generateTypeDefinition(type: TypeMetadata): string {
-    let fields: string;
+    // For regular types, include only scalar fields (no @sql_query on type fields)
+    const fields = type.fields
+      .filter((field) => {
+        // Include only scalar types (no @sql_query on type fields)
+        return this.isScalarType(field.type);
+      })
+      .map((field) => {
+        let fieldType = field.type;
 
-    if (type.isResolver) {
-      // For resolver types, include all fields since they're resolved by Lambda functions
-      fields = type.fields
-        .map((field) => {
-          let fieldType = field.type;
+        // Handle list types
+        if (field.isList) {
+          fieldType = `[${fieldType}!]`;
+        }
 
-          // Handle list types
-          if (field.isList) {
-            fieldType = `[${fieldType}!]`;
-          }
+        // Handle required types
+        if (field.isRequired) {
+          fieldType = `${fieldType}!`;
+        }
 
-          // Handle required types
-          if (field.isRequired) {
-            fieldType = `${fieldType}!`;
-          }
-
-          // Include arguments if field has them
-          const args = this.generateFieldArguments(field);
-          return `  ${field.name}${args}: ${fieldType}`;
-        })
-        .join("\n");
-    } else {
-      // For regular types, include scalar fields AND fields with SQL queries AND fields that return resolver types
-      fields = type.fields
-        .filter((field) => {
-          // Include if it's a scalar type
-          if (this.isScalarType(field.type)) return true;
-
-          // Include if it has a SQL query
-          if (field.sqlQuery) return true;
-
-          // Include if it returns a resolver type
-          const referencedType = this.schemaMetadata.types.find(
-            (t) => t.name === field.type
-          );
-          if (referencedType && referencedType.isResolver) return true;
-
-          return false;
-        })
-        .map((field) => {
-          let fieldType = field.type;
-
-          // Handle list types
-          if (field.isList) {
-            fieldType = `[${fieldType}!]`;
-          }
-
-          // Handle required types
-          if (field.isRequired) {
-            fieldType = `${fieldType}!`;
-          }
-
-          // Include arguments if field has them
-          const args = this.generateFieldArguments(field);
-          return `  ${field.name}${args}: ${fieldType}`;
-        })
-        .join("\n");
-    }
+        // Include arguments if field has them
+        const args = this.generateFieldArguments(field);
+        return `  ${field.name}${args}: ${fieldType}`;
+      })
+      .join("\n");
 
     return `type ${type.name} {\n${fields}\n}`;
   }
@@ -1572,12 +1426,12 @@ def send_cascade_deletion_message(entity_type, entity_id):
 
   private generateRootTypes(): string {
     const crudQueries = this.schemaMetadata.types
-      .filter((type) => !type.isPrimitive && !type.isResolver)
+      .filter((type) => !type.isPrimitive && !type.isTaskResponse)
       .map((type) => `  read${type.name}(id: ID!): ${type.name}`)
       .join("\n");
 
     const crudMutations = this.schemaMetadata.types
-      .filter((type) => !type.isPrimitive && !type.isResolver)
+      .filter((type) => !type.isPrimitive && !type.isTaskResponse)
       .flatMap((type) => [
         `  create${type.name}(input: Create${type.name}Input!): ${type.name}!`,
         `  update${type.name}(id: ID!, input: Update${type.name}Input!): ${type.name}!`,
@@ -1585,24 +1439,9 @@ def send_cascade_deletion_message(entity_type, entity_id):
       ])
       .join("\n");
 
-    // Generate custom queries with their arguments
-    const customQueries = this.schemaMetadata.queries
-      .map((q) => {
-        const args = q.arguments
-          ? q.arguments
-              .map((arg) => {
-                const argType = arg.isList ? `[${arg.type}!]` : arg.type;
-                const required = arg.isRequired ? "!" : "";
-                return `${arg.name}: ${argType}${required}`;
-              })
-              .join(", ")
-          : "";
-        const argsString = args ? `(${args})` : "";
-        const returnType = q.isList ? `[${q.type}!]` : q.type;
-        const required = q.isRequired ? "!" : "";
-        return `  ${q.name}${argsString}: ${returnType}${required}`;
-      })
-      .join("\n");
+    // Original Query fields are not included - they are replaced by triggerTask mutations and taskResult queries
+    // All Query fields are automatically tasks, so users must use triggerTask... and taskResult... APIs
+    const customQueries = "";
 
     // Generate custom mutations with their arguments
     // Exclude DELETE mutations - they are handled as triggerTask mutations
@@ -1699,7 +1538,6 @@ def send_cascade_deletion_message(entity_type, entity_id):
     return `
 type Query {
 ${crudQueries}
-${customQueries}
 ${taskResultQueries}
 ${deletionTaskResultQueries}
 }
@@ -2006,15 +1844,7 @@ exports.handler = async (event) => {
     }
 
     // If query returns a resolver type, count SQL queries in that type
-    const resolverType = this.schemaMetadata.types.find(
-      (t) => t.name === query.type && t.isResolver
-    );
-
-    if (resolverType) {
-      // Count all fields with @sql_query in the resolver type
-      return resolverType.fields.filter((f) => f.sqlQuery).length;
-    }
-
+    // @resolver directive no longer supported
     return 0;
   }
 
@@ -2133,6 +1963,31 @@ exports.handler = async (event) => {
     const capitalizedQueryName = this.capitalizeFirst(queryName);
     const returnType = query.isList ? `[${query.type}!]` : query.type;
 
+    // Get the response type metadata to build field mapping
+    const responseType = this.schemaMetadata.types.find(
+      (t) => t.name === query.type
+    );
+    const graphQLFields: string[] = [];
+    const athenaToGraphQLMap: Record<string, string> = {};
+
+    // Track datetime fields for conversion
+    const datetimeFields: string[] = [];
+
+    if (responseType) {
+      // Create reverse mapping: lowercase Athena column name -> GraphQL camelCase field name
+      responseType.fields.forEach((field) => {
+        const graphQLFieldName = field.name;
+        const athenaColumnName = field.name.toLowerCase();
+        graphQLFields.push(graphQLFieldName);
+        athenaToGraphQLMap[athenaColumnName] = graphQLFieldName;
+
+        // Track AWSDateTime fields for format conversion
+        if (field.type === "AWSDateTime") {
+          datetimeFields.push(graphQLFieldName);
+        }
+      });
+    }
+
     return `
 const { DynamoDBClient, GetItemCommand, UpdateItemCommand } = require('@aws-sdk/client-dynamodb');
 const { AthenaClient, GetQueryExecutionCommand, GetQueryResultsCommand } = require('@aws-sdk/client-athena');
@@ -2141,6 +1996,63 @@ const { unmarshall } = require('@aws-sdk/util-dynamodb');
 const dynamoClient = new DynamoDBClient({ region: process.env.AWS_REGION });
 const athenaClient = new AthenaClient({ region: process.env.AWS_REGION });
 const TABLE_NAME = process.env.DYNAMODB_TABLE_NAME;
+
+// Mapping from Athena lowercase column names to GraphQL camelCase field names
+const athenaToGraphQLMap = ${JSON.stringify(athenaToGraphQLMap)};
+const graphQLFields = ${JSON.stringify(graphQLFields)};
+const datetimeFields = ${JSON.stringify(datetimeFields)};
+
+// Helper function to map Athena column names to GraphQL field names (case-insensitive)
+function mapAthenaToGraphQL(athenaColumnName) {
+  const lowerColumn = athenaColumnName.toLowerCase();
+  // Look up in the mapping
+  if (athenaToGraphQLMap[lowerColumn]) {
+    return athenaToGraphQLMap[lowerColumn];
+  }
+  // Fallback: try to find case-insensitive match in GraphQL fields
+  for (const graphQLField of graphQLFields) {
+    if (graphQLField.toLowerCase() === lowerColumn) {
+      return graphQLField;
+    }
+  }
+  // Fallback: return original if no match found
+  return athenaColumnName;
+}
+
+// Helper function to convert Athena datetime format to ISO 8601
+// Athena returns: "2025-12-09 09:38:26.778" (SQL format)
+// GraphQL AWSDateTime expects: "2025-12-09T09:38:26.778Z" (ISO 8601)
+function convertDateTime(value, fieldName) {
+  if (!value || !datetimeFields.includes(fieldName)) {
+    return value;
+  }
+  
+  if (typeof value !== 'string') {
+    return value;
+  }
+  
+  // If already in ISO format (contains T), check if it has timezone
+  if (value.includes('T')) {
+    // If it ends with Z or has timezone offset (+/-HH:MM), return as-is
+    if (value.endsWith('Z') || /[+-]\\d{2}:\\d{2}$/.test(value)) {
+      return value;
+    }
+    // Add Z if missing timezone
+    return value + 'Z';
+  }
+  
+  // Convert SQL datetime format to ISO 8601
+  // Format: "2025-12-09 09:38:26.778" -> "2025-12-09T09:38:26.778Z"
+  // Replace space with T
+  let isoValue = value.replace(' ', 'T');
+  
+  // Add Z if no timezone indicator present
+  if (!isoValue.includes('Z') && !/[+-]\\d{2}:\\d{2}$/.test(isoValue)) {
+    isoValue = isoValue + 'Z';
+  }
+  
+  return isoValue;
+}
 
 exports.handler = async (event) => {
   try {
@@ -2238,10 +2150,17 @@ exports.handler = async (event) => {
         
         const rows = athenaResults.ResultSet?.Rows || [];
         const headers = rows[0]?.Data?.map(col => col.VarCharValue) || [];
+        
         const data = rows.slice(1).map(row => {
           const obj = {};
           row.Data?.forEach((col, index) => {
-            obj[headers[index]] = col.VarCharValue;
+            const athenaColumnName = headers[index] || '';
+            // Map Athena column name (lowercase) to GraphQL field name (camelCase)
+            const graphQLFieldName = mapAthenaToGraphQL(athenaColumnName);
+            let value = col.VarCharValue;
+            // Convert datetime fields to ISO 8601 format
+            value = convertDateTime(value, graphQLFieldName);
+            obj[graphQLFieldName] = value;
           });
           return obj;
         });

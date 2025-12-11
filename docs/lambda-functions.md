@@ -12,27 +12,38 @@ OC-GraphQL automatically generates a comprehensive set of Lambda functions to ha
 4. **Task Trigger Mutations** - Start asynchronous long-running queries
 5. **Task Result Queries** - Poll task status and retrieve results
 6. **Execution Tracker** - EventBridge Lambda for tracking Athena query executions
-7. **Resolver Functions** - Complex type resolution with multiple SQL queries
-8. **Field Resolver Functions** - Individual field-level SQL queries
-9. **Stream Processor** - DynamoDB to Parquet data pipeline
-10. **Cascade Deletion Listener** - SQS queue listener for cleaning up join table relations
+7. **Stream Processor** - DynamoDB to Parquet data pipeline
+8. **Cascade Deletion Listener** - SQS queue listener for cleaning up join table relations
+9. **Deletion Listener** - SQS queue listener for DELETE SQL operations
 
 ## 📋 Function Naming Patterns
 
-### Consistent Naming Convention
+### Hash-Based Naming Convention
+
+Lambda function names use a hash-based pattern to avoid AWS's 64-character limit. The hash is generated from the full function identifier and truncated to 16 characters.
 
 ```
-Pattern: OCG-{project}-{category}-{identifier}
+Pattern: OCG-{project}-{hash}
+Where hash = first 16 characters of SHA256({project}-{category}-{identifier})
+
 Examples:
-- OCG-blog-create-user
-- OCG-blog-query-getPopularPosts
-- OCG-blog-mutation-triggerTaskGenerateReport
-- OCG-blog-query-taskResultGenerateReport
-- OCG-blog-athena-execution-tracker
-- OCG-blog-resolver-postconnection
-- OCG-blog-stream-processor
-- OCG-blog-cascade-deletion-listener
+- OCG-blog-a1b2c3d4e5f6g7h8 (for blog-create-user)
+- OCG-blog-i9j0k1l2m3n4o5p6 (for blog-mutation-triggerTaskGenerateReport)
+- OCG-blog-q7r8s9t0u1v2w3x4 (for blog-query-taskResultGenerateReport)
+- OCG-blog-y5z6a7b8c9d0e1f2 (for blog-stream-processor)
+- OCG-blog-c3d4e5f6g7h8i9j0 (for blog-cascade-deletion-listener)
 ```
+
+**Function Identifier Patterns (used for hash generation):**
+
+- CRUD: `{project}-{operation}-{entity}` (e.g., `blog-create-user`)
+- Mutations: `{project}-mutation-{mutationName}` (e.g., `blog-mutation-likePost`)
+- Task Triggers: `{project}-mutation-triggerTask{QueryName}` (e.g., `blog-mutation-triggerTaskGetUsersByCity`)
+- Task Results: `{project}-query-taskResult{QueryName}` (e.g., `blog-query-taskResultGetUsersByCity`)
+- Stream Processor: `{project}-stream-processor`
+- Cascade Deletion Listener: `{project}-cascade-deletion-listener`
+- Deletion Listener: `{project}-deletion-listener`
+- Athena Execution Tracker: `{project}-athena-execution-tracker`
 
 ## 🔧 Function Types & Implementation
 
@@ -43,8 +54,8 @@ Auto-generated for each entity type to handle basic database operations.
 #### Create Function
 
 ```javascript
-// Pattern: OCG-{project}-create-{entity}
-// Example: OCG-blog-create-user
+// Pattern: OCG-{project}-{hash} (hash from: {project}-create-{entity})
+// Example: OCG-blog-a1b2c3d4e5f6g7h8
 
 const { DynamoDBClient, PutItemCommand } = require("@aws-sdk/client-dynamodb");
 const { marshall } = require("@aws-sdk/util-dynamodb");
@@ -79,8 +90,8 @@ exports.handler = async (event) => {
 #### Read Function
 
 ```javascript
-// Pattern: OCG-{project}-read-{entity}
-// Example: OCG-blog-read-user
+// Pattern: OCG-{project}-{hash} (hash from: {project}-read-{entity})
+// Example: OCG-blog-i9j0k1l2m3n4o5p6
 
 const { DynamoDBClient, GetItemCommand } = require("@aws-sdk/client-dynamodb");
 const { unmarshall } = require("@aws-sdk/util-dynamodb");
@@ -109,8 +120,8 @@ exports.handler = async (event) => {
 #### Update Function
 
 ```javascript
-// Pattern: OCG-{project}-update-{entity}
-// Example: OCG-blog-update-user
+// Pattern: OCG-{project}-{hash} (hash from: {project}-update-{entity})
+// Example: OCG-blog-q7r8s9t0u1v2w3x4
 
 exports.handler = async (event) => {
   const id = event.arguments.id;
@@ -149,8 +160,8 @@ exports.handler = async (event) => {
 #### Delete Function
 
 ```javascript
-// Pattern: OCG-{project}-delete-{entity}
-// Example: OCG-blog-delete-user
+// Pattern: OCG-{project}-{hash} (hash from: {project}-delete-{entity})
+// Example: OCG-blog-y5z6a7b8c9d0e1f2
 
 exports.handler = async (event) => {
   const id = event.arguments.id;
@@ -174,8 +185,8 @@ exports.handler = async (event) => {
 Execute custom SQL queries for complex data retrieval.
 
 ```javascript
-// Pattern: OCG-{project}-query-{queryName}
-// Example: OCG-blog-query-getPopularPosts
+// Pattern: OCG-{project}-{hash} (hash from: {project}-mutation-{mutationName})
+// Example: OCG-blog-c3d4e5f6g7h8i9j0
 
 const {
   AthenaClient,
@@ -240,17 +251,17 @@ exports.handler = async (event) => {
 
 ### 3. Task Trigger Mutations (Node.js 18.x)
 
-Auto-generated for queries with `@task` directive to handle long-running Athena queries asynchronously.
+Auto-generated for all `Query` fields to handle long-running Athena queries asynchronously.
 
 **Requirements:**
 
-- `@task` can only be used on `Query` fields (not `Mutation`)
+- All `Query` fields are automatically tasks (no `@task` directive needed)
 - The return type must have the `@task_response` directive
 - Types with `@task_response` do not generate CRUD operations
 
 ```javascript
-// Pattern: OCG-{project}-mutation-triggerTask{QueryName}
-// Example: OCG-blog-mutation-triggerTaskGenerateYearlyReport
+// Pattern: OCG-{project}-{hash} (hash from: {project}-mutation-triggerTask{QueryName})
+// Example: OCG-blog-e1f2g3h4i5j6k7l8
 
 const { DynamoDBClient, PutItemCommand } = require("@aws-sdk/client-dynamodb");
 const {
@@ -323,8 +334,8 @@ exports.handler = async (event) => {
 Poll task status and retrieve results for completed tasks.
 
 ```javascript
-// Pattern: OCG-{project}-query-taskResult{QueryName}
-// Example: OCG-blog-query-taskResultGenerateYearlyReport
+// Pattern: OCG-{project}-{hash} (hash from: {project}-query-taskResult{QueryName})
+// Example: OCG-blog-g5h6i7j8k9l0m1n2
 
 const {
   DynamoDBClient,
@@ -486,8 +497,8 @@ exports.handler = async (event) => {
 EventBridge Lambda that automatically tracks Athena query execution state changes and updates task status.
 
 ```javascript
-// Pattern: OCG-{project}-athena-execution-tracker
-// Example: OCG-blog-athena-execution-tracker
+// Pattern: OCG-{project}-{hash} (hash from: {project}-athena-execution-tracker)
+// Example: OCG-blog-i9j0k1l2m3n4o5p6
 
 const {
   DynamoDBClient,
@@ -615,90 +626,13 @@ exports.handler = async (event) => {
 - Handles both EventBridge and CloudTrail event structures
 - **Note**: The `taskResult` query also polls Athena directly as a fallback, so tasks work even without EventBridge
 
-### 6. Resolver Functions (Node.js 18.x)
-
-Handle complex types with multiple SQL queries executed in parallel.
-
-```javascript
-// Pattern: OCG-{project}-resolver-{typeName}
-// Example: OCG-blog-resolver-postconnection
-
-exports.handler = async (event) => {
-  const sourceArgs = event.source || {};
-  const fieldArgs = event.arguments || {};
-
-  // Determine which field is being requested
-  const requestedField = event.info?.fieldName;
-
-  // Execute multiple SQL queries in parallel
-  const queryPromises = [
-    executeQuery(
-      `SELECT * FROM post WHERE user_id = $source.id ORDER BY created_at DESC LIMIT $args.limit OFFSET $args.offset`,
-      { ...sourceArgs, ...fieldArgs }
-    ).then((result) => ({ field: "items", result: result })),
-
-    executeQuery(
-      `SELECT COUNT(*) as count FROM post WHERE user_id = $source.id`,
-      { ...sourceArgs, ...fieldArgs }
-    ).then((result) => ({
-      field: "totalCount",
-      result: result[0]["count"] || 0,
-    })),
-  ];
-
-  const results = await Promise.all(queryPromises);
-
-  // Build response object
-  const response = {};
-  results.forEach(({ field, result }) => {
-    response[field] = result;
-  });
-
-  // Handle @return directives
-  response.hasMore = fieldArgs.offset + fieldArgs.limit < response.totalCount;
-
-  // Return only the requested field value
-  if (requestedField && response.hasOwnProperty(requestedField)) {
-    return response[requestedField];
-  }
-
-  return response;
-};
-```
-
-### 7. Field Resolver Functions (Node.js 18.x)
-
-Execute SQL queries for individual fields within regular entity types.
-
-```javascript
-// Pattern: OCG-{project}-field-{typeName}-{fieldName}
-// Example: OCG-blog-field-user-totalPosts
-
-exports.handler = async (event) => {
-  let query = `SELECT COUNT(*) as count FROM post WHERE user_id = $source.id`;
-
-  // Replace source parameters
-  if (event.source) {
-    Object.entries(event.source).forEach(([key, value]) => {
-      const sourcePattern = "$source." + key;
-      const sqlSafeValue = escapeSqlValue(value);
-      query = query.split(sourcePattern).join(sqlSafeValue);
-    });
-  }
-
-  // Execute query and return scalar result
-  const results = await executeQuery(query, event.source || {});
-  return results[0]?.count || 0;
-};
-```
-
-### 8. Stream Processor (Python 3.11)
+### 6. Stream Processor (Python 3.11)
 
 Real-time DynamoDB to Parquet conversion with advanced optimization, join table support, and automatic Glue table management.
 
 ```python
-# Pattern: OCG-{project}-stream-processor
-# Example: OCG-blog-stream-processor
+# Pattern: OCG-{project}-{hash} (hash from: {project}-stream-processor)
+# Example: OCG-blog-k7l8m9n0o1p2q3r4
 
 import json
 import os
@@ -1135,7 +1069,7 @@ def format_date_parts(date_obj):
 - **Error Resilience**: Continues processing other records if one fails
 - **Cascade Deletion**: Sends SQS messages for entity deletions to trigger join table cleanup
 
-### 9. Cascade Deletion Listener (Node.js 18.x)
+### 7. Cascade Deletion Listener (Node.js 18.x)
 
 SQS queue listener that automatically cleans up join table relations and S3 files when entities are deleted.
 
@@ -1144,8 +1078,8 @@ SQS queue listener that automatically cleans up join table relations and S3 file
 Processes deletion tasks for DELETE SQL operations. Retrieves query results from Athena and deletes S3 Parquet files.
 
 ```javascript
-// Pattern: OCG-{project}-cascade-deletion-listener
-// Example: OCG-blog-cascade-deletion-listener
+// Pattern: OCG-{project}-{hash} (hash from: {project}-cascade-deletion-listener)
+// Example: OCG-blog-m5n6o7p8q9r0s1t2
 
 const {
   DynamoDBClient,
@@ -1224,8 +1158,8 @@ exports.handler = async (event) => {
 Processes deletion tasks for DELETE SQL operations. Retrieves query results from Athena and performs complete cleanup of both DynamoDB items and S3 Parquet files.
 
 ```javascript
-// Pattern: OCG-{project}-deletion-listener
-// Example: OCG-blog-deletion-listener
+// Pattern: OCG-{project}-{hash} (hash from: {project}-deletion-listener)
+// Example: OCG-blog-o3p4q5r6s7t8u9v0
 
 const {
   AthenaClient,
@@ -1450,10 +1384,10 @@ This automatically generates:
 All functions receive these environment variables:
 
 ```bash
-DYNAMODB_TABLE_NAME={project}
-S3_BUCKET_NAME={project}-{account-id}
+DYNAMODB_TABLE_NAME=OCG-{project}
+S3_BUCKET_NAME=ocg-{project}-{account-id}
 ATHENA_DATABASE_NAME={project}_db
-ATHENA_OUTPUT_LOCATION=s3://{project}-athena-results-{account-id}/query-results/
+ATHENA_OUTPUT_LOCATION=s3://ocg-{project}-athena-results-{account-id}/query-results/
 CASCADE_DELETION_QUEUE_URL=https://sqs.{region}.amazonaws.com/{account}/{project}-cascade-deletion
 AWS_REGION={region}
 ```
@@ -1475,7 +1409,7 @@ AWS_REGION={region}
 }
 ```
 
-#### Query/Resolver Functions
+#### Query/Mutation Functions
 
 ```json
 {

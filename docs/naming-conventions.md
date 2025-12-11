@@ -38,71 +38,37 @@ Example: OcGraphql-my-blog-api
 
 ### Lambda Functions
 
-#### CRUD Operations
+**Note:** Lambda function names use a hash-based pattern to avoid AWS's 64-character limit. The hash is generated from the full function identifier and truncated to 16 characters.
 
 ```
-Pattern: OCG-{project}-{operation}-{entity}
+Pattern: OCG-{project}-{hash}
+Where hash = first 16 characters of SHA256({project}-{category}-{identifier})
+
 Examples:
-- OCG-blog-create-user
-- OCG-blog-read-post
-- OCG-blog-update-comment
-- OCG-blog-delete-article
+- OCG-blog-a1b2c3d4e5f6g7h8 (for blog-create-user)
+- OCG-blog-i9j0k1l2m3n4o5p6 (for blog-mutation-likePost)
+- OCG-blog-q7r8s9t0u1v2w3x4 (for blog-query-taskResultGetUsersByCity)
+- OCG-blog-y5z6a7b8c9d0e1f2 (for blog-stream-processor)
 ```
 
-#### Query Functions
+**Function Categories:**
 
-```
-Pattern: OCG-{project}-query-{queryName}
-Examples:
-- OCG-blog-query-getPublishedPosts
-- OCG-blog-query-searchUsers
-- OCG-blog-query-getUsersByCity
-```
-
-#### Mutation Functions
-
-```
-Pattern: OCG-{project}-mutation-{mutationName}
-Examples:
-- OCG-blog-mutation-likePost
-- OCG-blog-mutation-followUser
-- OCG-blog-mutation-addComment
-```
-
-#### Resolver Functions
-
-```
-Pattern: OCG-{project}-resolver-{typeName}
-Examples:
-- OCG-blog-resolver-postconnection
-- OCG-blog-resolver-useranalytics
-- OCG-blog-resolver-commentpagination
-```
-
-#### Field Resolver Functions
-
-```
-Pattern: OCG-{project}-field-{typeName}-{fieldName}
-Examples:
-- OCG-blog-field-user-totalPosts
-- OCG-blog-field-post-likeCount
-- OCG-blog-field-comment-authorDetails
-```
-
-#### Stream Processor
-
-```
-Pattern: OCG-{project}-stream-processor
-Example: OCG-blog-stream-processor
-```
+- CRUD: `{project}-{operation}-{entity}` (e.g., `blog-create-user`)
+- Mutations: `{project}-mutation-{mutationName}` (e.g., `blog-mutation-likePost`)
+- Task Triggers: `{project}-mutation-triggerTask{QueryName}` (e.g., `blog-mutation-triggerTaskGetUsersByCity`)
+- Task Results: `{project}-query-taskResult{QueryName}` (e.g., `blog-query-taskResultGetUsersByCity`)
+- Stream Processor: `{project}-stream-processor`
+- Cascade Deletion Listener: `{project}-cascade-deletion-listener`
+- Deletion Listener: `{project}-deletion-listener`
+- Athena Execution Tracker: `{project}-athena-execution-tracker`
 
 ### DynamoDB Resources
 
 #### Table Name
 
 ```
-Pattern: {projectName}
-Example: my-blog-api
+Pattern: OCG-{projectName}
+Example: OCG-my-blog-api
 ```
 
 #### Key Structure
@@ -127,14 +93,16 @@ Examples:
 
 #### Bucket Names
 
+**Note:** S3 bucket names must be lowercase (AWS requirement).
+
 ```
 Data Lake Bucket:
-Pattern: {projectName}-{accountId}
-Example: my-blog-api-123456789012
+Pattern: ocg-{projectName}-{accountId}
+Example: ocg-my-blog-api-123456789012
 
 Athena Results Bucket:
-Pattern: {projectName}-athena-results-{accountId}
-Example: my-blog-api-athena-results-123456789012
+Pattern: ocg-{projectName}-athena-results-{accountId}
+Example: ocg-my-blog-api-athena-results-123456789012
 ```
 
 #### S3 Object Keys (Parquet Files)
@@ -373,13 +341,14 @@ S3 Keys: a-z, A-Z, 0-9, hyphens (-), periods (.), underscores (_), forward slash
 #### All Lambda Functions for a Project
 
 ```bash
+# List all Lambda functions for a project (hash-based names)
 aws lambda list-functions --query "Functions[?starts_with(FunctionName, 'OCG-my-blog-')]"
 ```
 
 #### All S3 Objects for an Entity Type
 
 ```bash
-aws s3 ls s3://my-blog-api-123456789012/tables/user/ --recursive
+aws s3 ls s3://ocg-my-blog-api-123456789012/tables/user/ --recursive
 ```
 
 #### All Glue Tables for a Project
@@ -406,9 +375,10 @@ const hasNoConsecutiveHyphens = !name.includes("--");
 ```
 Project: blog
 Stack: OcGraphql-blog
-Functions: OCG-blog-create-user, OCG-blog-read-post
+Functions: OCG-blog-a1b2c3d4e5f6g7h8, OCG-blog-i9j0k1l2m3n4o5p6 (hash-based)
 Database: blog_db
-Buckets: blog-123456789012
+Table: OCG-blog
+Buckets: ocg-blog-123456789012
 ```
 
 ### Medium Project (E-commerce)
@@ -416,9 +386,10 @@ Buckets: blog-123456789012
 ```
 Project: ecommerce-platform
 Stack: OcGraphql-ecommerce-platform
-Functions: OCG-ecommerce-platform-create-product
+Functions: OCG-ecommerce-platform-{hash} (hash-based)
 Database: ecommerce_platform_db
-Buckets: ecommerce-platform-123456789012
+Table: OCG-ecommerce-platform
+Buckets: ocg-ecommerce-platform-123456789012
 ```
 
 ### Large Project (Enterprise)
@@ -426,9 +397,10 @@ Buckets: ecommerce-platform-123456789012
 ```
 Project: enterprise-crm-system
 Stack: OcGraphql-enterprise-crm-system
-Functions: OCG-enterprise-crm-system-resolver-customeranalytics
+Functions: OCG-enterprise-crm-system-{hash} (hash-based)
 Database: enterprise_crm_system_db
-Buckets: enterprise-crm-system-123456789012
+Table: OCG-enterprise-crm-system
+Buckets: ocg-enterprise-crm-system-123456789012
 ```
 
 ---

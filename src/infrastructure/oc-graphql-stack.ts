@@ -22,6 +22,16 @@ import {
 } from "aws-cdk-lib/aws-lambda-event-sources";
 import { SchemaMetadata } from "../parsers/schema-parser";
 import * as path from "path";
+import * as crypto from "crypto";
+
+/**
+ * Generate a short hash (first 16 characters) from a string
+ * Used for Lambda function names to avoid 64 character limit
+ */
+function generateShortHash(input: string): string {
+  const hash = crypto.createHash("sha256").update(input).digest("hex");
+  return hash.substring(0, 16);
+}
 
 export interface OcGraphQLStackProps extends StackProps {
   projectName: string;
@@ -46,7 +56,7 @@ export class OcGraphQLStack extends Stack {
 
     // DynamoDB Table
     const table = new dynamodb.Table(this, "DataTable", {
-      tableName: projectName,
+      tableName: `OCG-${projectName}`,
       partitionKey: { name: "PK", type: dynamodb.AttributeType.STRING },
       sortKey: { name: "SK", type: dynamodb.AttributeType.STRING },
       billingMode: dynamodb.BillingMode.PAY_PER_REQUEST,
@@ -64,7 +74,7 @@ export class OcGraphQLStack extends Stack {
 
     // S3 Bucket for data lake
     const dataBucket = new s3.Bucket(this, "DataBucket", {
-      bucketName: `${projectName}-${this.account}`,
+      bucketName: `ocg-${projectName.toLowerCase()}-${this.account}`,
       removalPolicy: storagePolicy,
       autoDeleteObjects: !retainStorage, // Only auto-delete if not retaining
       versioned: true,
@@ -73,7 +83,7 @@ export class OcGraphQLStack extends Stack {
 
     // S3 Bucket for Athena query results
     const athenaResultsBucket = new s3.Bucket(this, "AthenaResultsBucket", {
-      bucketName: `${projectName}-athena-results-${this.account}`,
+      bucketName: `ocg-${projectName.toLowerCase()}-athena-results-${this.account}`,
       removalPolicy: storagePolicy,
       autoDeleteObjects: !retainStorage, // Only auto-delete if not retaining
       versioned: true,
@@ -245,8 +255,10 @@ export class OcGraphQLStack extends Stack {
     this.createAppSyncResolvers(api, lambdaFunctions, schemaMetadata);
 
     // DynamoDB Stream processor (Python with Parquet support)
+    const streamProcessorFunctionName = `${projectName}-stream-processor`;
+    const streamProcessorHash = generateShortHash(streamProcessorFunctionName);
     const streamProcessor = new lambda.Function(this, "StreamProcessor", {
-      functionName: `OCG-${projectName}-stream-processor`,
+      functionName: `OCG-${projectName}-${streamProcessorHash}`,
       runtime: lambda.Runtime.PYTHON_3_11,
       handler: `ocg-${projectName}-stream-processor.lambda_handler`,
       code: lambda.Code.fromAsset(generatedCodePath),
@@ -276,11 +288,15 @@ export class OcGraphQLStack extends Stack {
     cascadeDeletionQueue.grantSendMessages(streamProcessor);
 
     // Cascade deletion queue listener Lambda (always created)
+    const cascadeDeletionListenerFunctionName = `${projectName}-cascade-deletion-listener`;
+    const cascadeDeletionListenerHash = generateShortHash(
+      cascadeDeletionListenerFunctionName
+    );
     const cascadeDeletionListener = new lambda.Function(
       this,
       "CascadeDeletionListener",
       {
-        functionName: `OCG-${projectName}-cascade-deletion-listener`,
+        functionName: `OCG-${projectName}-${cascadeDeletionListenerHash}`,
         runtime: lambda.Runtime.NODEJS_18_X,
         handler: `ocg-${projectName}-cascade-deletion-listener.handler`,
         code: lambda.Code.fromAsset(generatedCodePath),
@@ -305,8 +321,12 @@ export class OcGraphQLStack extends Stack {
 
     // Deletion listener Lambda (for DELETE SQL operations)
     if (hasDeleteMutations && deletionQueue) {
+      const deletionListenerFunctionName = `${projectName}-deletion-listener`;
+      const deletionListenerHash = generateShortHash(
+        deletionListenerFunctionName
+      );
       const deletionListener = new lambda.Function(this, "DeletionListener", {
-        functionName: `OCG-${projectName}-deletion-listener`,
+        functionName: `OCG-${projectName}-${deletionListenerHash}`,
         runtime: lambda.Runtime.NODEJS_18_X,
         handler: `ocg-${projectName}-deletion-listener.handler`,
         code: lambda.Code.fromAsset(generatedCodePath),
@@ -386,16 +406,17 @@ export class OcGraphQLStack extends Stack {
 
     // CRUD functions for each type
     for (const type of schemaMetadata.types) {
-      if (!type.isPrimitive && !type.isResolver) {
+      if (!type.isPrimitive) {
         const typeName = type.name.toLowerCase();
 
         ["create", "read", "update", "delete"].forEach((operation) => {
           const functionName = `${projectName}-${operation}-${typeName}`;
+          const hash = generateShortHash(functionName);
           functions[functionName] = new lambda.Function(
             this,
             `${operation}${type.name}Function`,
             {
-              functionName: `OCG-${functionName}`,
+              functionName: `OCG-${projectName}-${hash}`,
               runtime: lambda.Runtime.NODEJS_18_X,
               handler: `ocg-${functionName}.handler`,
               code: lambda.Code.fromAsset(generatedCodePath),
@@ -408,25 +429,8 @@ export class OcGraphQLStack extends Stack {
       }
     }
 
-    // Query functions
-    for (const query of schemaMetadata.queries) {
-      if (query.sqlQuery) {
-        const functionName = `${projectName}-query-${query.name}`;
-        functions[functionName] = new lambda.Function(
-          this,
-          `Query${query.name}Function`,
-          {
-            functionName: `OCG-${functionName}`,
-            runtime: lambda.Runtime.NODEJS_18_X,
-            handler: `ocg-${functionName}.handler`,
-            code: lambda.Code.fromAsset(generatedCodePath),
-            role,
-            environment: commonEnvironment,
-            timeout: Duration.minutes(5),
-          }
-        );
-      }
-    }
+    // Query fields are automatically tasks - no direct Lambda functions created
+    // Users must use triggerTask... mutations and taskResult... queries instead
 
     // Mutation functions (exclude DELETE mutations - they use triggerTask)
     for (const mutation of schemaMetadata.mutations) {
@@ -462,11 +466,12 @@ export class OcGraphQLStack extends Stack {
           const capitalizedName =
             mutation.name.charAt(0).toUpperCase() + mutation.name.slice(1);
           const functionName = `${projectName}-mutation-triggerTask${capitalizedName}`;
+          const hash = generateShortHash(functionName);
           functions[functionName] = new lambda.Function(
             this,
             `TriggerTaskDeletion${capitalizedName}Function`,
             {
-              functionName: `OCG-${functionName}`,
+              functionName: `OCG-${projectName}-${hash}`,
               runtime: lambda.Runtime.NODEJS_18_X,
               handler: `ocg-${functionName}.handler`,
               code: lambda.Code.fromAsset(generatedCodePath),
@@ -487,11 +492,12 @@ export class OcGraphQLStack extends Stack {
           const capitalizedName =
             mutation.name.charAt(0).toUpperCase() + mutation.name.slice(1);
           const functionName = `${projectName}-query-taskResult${capitalizedName}`;
+          const hash = generateShortHash(functionName);
           functions[functionName] = new lambda.Function(
             this,
             `TaskResultDeletion${capitalizedName}Function`,
             {
-              functionName: `OCG-${functionName}`,
+              functionName: `OCG-${projectName}-${hash}`,
               runtime: lambda.Runtime.NODEJS_18_X,
               handler: `ocg-${functionName}.handler`,
               code: lambda.Code.fromAsset(generatedCodePath),
@@ -504,49 +510,8 @@ export class OcGraphQLStack extends Stack {
       }
     }
 
-    // Resolver functions
-    for (const type of schemaMetadata.types) {
-      if (type.isResolver) {
-        const functionName = `${projectName}-resolver-${type.name.toLowerCase()}`;
-        functions[functionName] = new lambda.Function(
-          this,
-          `Resolver${type.name}Function`,
-          {
-            functionName: `OCG-${functionName}`,
-            runtime: lambda.Runtime.NODEJS_18_X,
-            handler: `ocg-${functionName}.handler`,
-            code: lambda.Code.fromAsset(generatedCodePath),
-            role,
-            environment: commonEnvironment,
-            timeout: Duration.minutes(5),
-          }
-        );
-      }
-    }
-
-    // Individual field resolvers for fields with @sql_query in regular types
-    for (const type of schemaMetadata.types) {
-      if (!type.isPrimitive && !type.isResolver) {
-        for (const field of type.fields) {
-          if (field.sqlQuery) {
-            const functionName = `${projectName}-field-${type.name.toLowerCase()}-${field.name}`;
-            functions[functionName] = new lambda.Function(
-              this,
-              `Field${type.name}${field.name}Function`,
-              {
-                functionName: `OCG-${functionName}`,
-                runtime: lambda.Runtime.NODEJS_18_X,
-                handler: `ocg-${functionName}.handler`,
-                code: lambda.Code.fromAsset(generatedCodePath),
-                role,
-                environment: commonEnvironment,
-                timeout: Duration.minutes(5),
-              }
-            );
-          }
-        }
-      }
-    }
+    // Removed: Resolver functions and field-level @sql_query resolvers
+    // @resolver directive and @sql_query on type fields are no longer supported
 
     // Task mutation functions (triggerTask)
     for (const query of schemaMetadata.queries) {
@@ -554,11 +519,12 @@ export class OcGraphQLStack extends Stack {
         const capitalizedName =
           query.name.charAt(0).toUpperCase() + query.name.slice(1);
         const functionName = `${projectName}-mutation-triggerTask${capitalizedName}`;
+        const hash = generateShortHash(functionName);
         functions[functionName] = new lambda.Function(
           this,
           `TriggerTask${capitalizedName}Function`,
           {
-            functionName: `OCG-${functionName}`,
+            functionName: `OCG-${projectName}-${hash}`,
             runtime: lambda.Runtime.NODEJS_18_X,
             handler: `ocg-${functionName}.handler`,
             code: lambda.Code.fromAsset(generatedCodePath),
@@ -576,11 +542,12 @@ export class OcGraphQLStack extends Stack {
         const capitalizedName =
           query.name.charAt(0).toUpperCase() + query.name.slice(1);
         const functionName = `${projectName}-query-taskResult${capitalizedName}`;
+        const hash = generateShortHash(functionName);
         functions[functionName] = new lambda.Function(
           this,
           `TaskResult${capitalizedName}Function`,
           {
-            functionName: `OCG-${functionName}`,
+            functionName: `OCG-${projectName}-${hash}`,
             runtime: lambda.Runtime.NODEJS_18_X,
             handler: `ocg-${functionName}.handler`,
             code: lambda.Code.fromAsset(generatedCodePath),
@@ -601,11 +568,12 @@ export class OcGraphQLStack extends Stack {
       schemaMetadata.queries.some((q) => q.isTask) || hasDeleteMutations;
     if (hasTasks) {
       const functionName = `${projectName}-athena-execution-tracker`;
+      const hash = generateShortHash(functionName);
       functions[functionName] = new lambda.Function(
         this,
         "AthenaExecutionTrackerFunction",
         {
-          functionName: `OCG-${functionName}`,
+          functionName: `OCG-${projectName}-${hash}`,
           runtime: lambda.Runtime.NODEJS_18_X,
           handler: `ocg-${functionName}.handler`,
           code: lambda.Code.fromAsset(generatedCodePath),
@@ -631,9 +599,9 @@ export class OcGraphQLStack extends Stack {
       dataSources[name] = api.addLambdaDataSource(`${name}DataSource`, func);
     });
 
-    // CRUD resolvers
+    // CRUD resolvers (skip @task_response types)
     for (const type of schemaMetadata.types) {
-      if (!type.isPrimitive && !type.isResolver) {
+      if (!type.isPrimitive && !type.isTaskResponse) {
         const typeName = type.name.toLowerCase();
         const projectName = this.projectName;
 
@@ -665,19 +633,8 @@ export class OcGraphQLStack extends Stack {
       }
     }
 
-    // Custom query resolvers (skip if it's a task query - those use taskResult instead)
-    for (const query of schemaMetadata.queries) {
-      if (query.sqlQuery && !query.isTask) {
-        const projectName = this.projectName;
-        const functionName = `${projectName}-query-${query.name}`;
-        if (dataSources[functionName]) {
-          dataSources[functionName].createResolver(`${query.name}Resolver`, {
-            typeName: "Query",
-            fieldName: query.name,
-          });
-        }
-      }
-    }
+    // Query fields are automatically tasks - no direct resolvers created
+    // Users must use triggerTask... mutations and taskResult... queries instead
 
     // Task result query resolvers
     for (const query of schemaMetadata.queries) {
@@ -685,8 +642,8 @@ export class OcGraphQLStack extends Stack {
         const projectName = this.projectName;
         const capitalizedName =
           query.name.charAt(0).toUpperCase() + query.name.slice(1);
-        // Match the Lambda function file name pattern: ocg-{projectName}-query-taskResult{Name}.js
-        const functionName = `ocg-${projectName}-query-taskResult${capitalizedName}.js`;
+        // Match the Lambda function key (without ocg- prefix and .js extension)
+        const functionName = `${projectName}-query-taskResult${capitalizedName}`;
         if (dataSources[functionName]) {
           dataSources[functionName].createResolver(
             `taskResult${capitalizedName}Resolver`,
@@ -801,68 +758,7 @@ export class OcGraphQLStack extends Stack {
       }
     }
 
-    // Individual field resolvers for fields with @sql_query in regular types
-    for (const type of schemaMetadata.types) {
-      if (!type.isPrimitive && !type.isResolver) {
-        for (const field of type.fields) {
-          if (field.sqlQuery) {
-            const functionName = `${this.projectName}-field-${type.name.toLowerCase()}-${field.name}`;
-            if (dataSources[functionName]) {
-              dataSources[functionName].createResolver(
-                `${type.name}${field.name}FieldResolver`,
-                {
-                  typeName: type.name,
-                  fieldName: field.name,
-                }
-              );
-            }
-          }
-        }
-      }
-    }
-
-    // Resolver type data sources - attach to ALL fields of the resolver type
-    for (const type of schemaMetadata.types) {
-      if (type.isResolver) {
-        const projectName = this.projectName;
-        const functionName = `${projectName}-resolver-${type.name.toLowerCase()}`;
-        if (dataSources[functionName]) {
-          // Create resolvers for ALL fields in the resolver type
-          for (const field of type.fields) {
-            dataSources[functionName].createResolver(
-              `${type.name}${field.name}Resolver`,
-              {
-                typeName: type.name,
-                fieldName: field.name,
-              }
-            );
-          }
-        }
-      }
-    }
-
-    // Attach resolver types to fields that reference them in other types
-    for (const type of schemaMetadata.types) {
-      if (!type.isPrimitive && !type.isResolver) {
-        for (const field of type.fields) {
-          // Check if field type is a resolver type
-          const referencedType = schemaMetadata.types.find(
-            (t) => t.name === field.type
-          );
-          if (referencedType && referencedType.isResolver) {
-            const functionName = `${this.projectName}-resolver-${referencedType.name.toLowerCase()}`;
-            if (dataSources[functionName]) {
-              dataSources[functionName].createResolver(
-                `${type.name}${field.name}ResolverTypeResolver`,
-                {
-                  typeName: type.name,
-                  fieldName: field.name,
-                }
-              );
-            }
-          }
-        }
-      }
-    }
+    // Removed: Field-level @sql_query resolvers and @resolver type resolvers
+    // @resolver directive and @sql_query on type fields are no longer supported
   }
 }

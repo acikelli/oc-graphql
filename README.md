@@ -126,11 +126,9 @@ The framework automatically generates and deploys:
 | ------------------- | ------------------------------ | ------------ | ---------- | ----------- | ------------------------- | ------------------------------------ |
 | CRUD Operations     | 4 per entity                   | Node.js 18.x | 128 MB     | 30 seconds  | Basic database operations | `OCG-api-create-user`                |
 | SQL Queries         | 1 per @sql_query               | Node.js 18.x | 256 MB     | 5 minutes   | Custom analytics          | `OCG-api-query-getTrendingPosts`     |
-| Task Mutations      | 1 per @task query              | Node.js 18.x | 256 MB     | 30 seconds  | Trigger async tasks       | `OCG-api-mutation-triggerTaskReport` |
-| Task Result Queries | 1 per @task query              | Node.js 18.x | 256 MB     | 30 seconds  | Poll task results         | `OCG-api-query-taskResultReport`     |
+| Task Mutations      | 1 per Query field              | Node.js 18.x | 256 MB     | 30 seconds  | Trigger async tasks       | `OCG-api-mutation-triggerTaskReport` |
+| Task Result Queries | 1 per Query field              | Node.js 18.x | 256 MB     | 30 seconds  | Poll task results         | `OCG-api-query-taskResultReport`     |
 | Execution Tracker   | 1 per project (if tasks exist) | Node.js 18.x | 256 MB     | 5 minutes   | Track Athena executions   | `OCG-api-athena-execution-tracker`   |
-| Resolvers           | 1 per @resolver type           | Node.js 18.x | 512 MB     | 5 minutes   | Complex type resolution   | `OCG-api-resolver-postconnection`    |
-| Field Resolvers     | 1 per @sql_query field         | Node.js 18.x | 256 MB     | 5 minutes   | Individual field queries  | `OCG-api-field-user-totalPosts`      |
 | Stream Processor    | 1 per project                  | Python 3.11  | 1024 MB    | 5 minutes   | Real-time data pipeline   | `OCG-api-stream-processor`           |
 
 **Function Naming Pattern**: `OCG-{project}-{category}-{identifier}`
@@ -195,13 +193,13 @@ type UserAnalytics @resolver {
 }
 ```
 
-### `@task` - Long-Running Query Tasks
+### Automatic Task Execution for Query Fields
 
-Handle queries that may exceed AppSync's 30-second timeout by executing them asynchronously.
+All `Query` fields are automatically executed as asynchronous tasks to handle long-running queries that may exceed AppSync's 30-second timeout.
 
 **Requirements:**
 
-- `@task` can only be used on `Query` fields (not `Mutation`)
+- All `Query` fields are automatically tasks (no `@task` directive needed)
 - The return type must have the `@task_response` directive
 - Types with `@task_response` do not generate CRUD operations
 
@@ -215,7 +213,6 @@ type Query {
       GROUP BY month ORDER BY month
       """
     )
-    @task
 }
 
 type ReportData @task_response {

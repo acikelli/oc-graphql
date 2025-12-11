@@ -334,10 +334,10 @@ Time: 1-3 seconds
 
 ```python
 # Lambda Environment Variables
-DYNAMODB_TABLE_NAME: {project}
-S3_BUCKET_NAME: {project}-{account}
+DYNAMODB_TABLE_NAME: OCG-{project}
+S3_BUCKET_NAME: ocg-{project}-{account}
 ATHENA_DATABASE_NAME: {project}_db
-ATHENA_OUTPUT_LOCATION: s3://{project}-athena-results-{account}/query-results/
+ATHENA_OUTPUT_LOCATION: s3://ocg-{project}-athena-results-{account}/query-results/
 
 # Lambda Settings
 Runtime: python3.11
