@@ -1,7 +1,7 @@
 {
   "name": "oc-graphql",
-  "version": "1.0.3",
-  "description": "One Command GraphQL - Serverless GraphQL automation tool for AWS",
+  "version": "1.0.0",
+  "description": "Create serverless GraphQL analytics APIs with one command",
   "repository": {
     "type": "git",
     "url": "https://github.com/acikelli/oc-graphql.git"

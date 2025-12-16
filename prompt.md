@@ -1,2 +1,0 @@
-- in @README.md Function Types Generated contains wrong example names for the functions. crud apis, mutations and quieris have hashed function names, validate and fix it. also let every function use 1024 mb of memory.
-- after the deployment, it outputs wrong appsync url. fix it and let it output only the appsync api url.

@@ -720,6 +720,11 @@ def handle_delete_operation(record, current_date, year, month, day):
     if not entity_type:
         return
     
+    # Skip task entities - they are metadata only and should not trigger S3 deletion
+    if entity_type == 'task':
+        logger.info(f"Skipping deletion of task entity (metadata only): {item.get('PK')}")
+        return
+    
     # Skip temporary joinTableData items - they are cleaned up after processing and shouldn't trigger S3 deletion
     if item.get('PK', '').startswith('joinTableData#'):
         logger.info(f"Skipping deletion of temporary joinTableData item: {item.get('PK')}")
@@ -781,6 +786,11 @@ def handle_insert_update_operation(record, event_name, current_date, year, month
     entity_type = item.get('entityType')
     
     if not entity_type:
+        return
+    
+    # Skip task entities - they are metadata only and should not be written to Parquet
+    if entity_type == 'task':
+        logger.info(f"Skipping task entity (metadata only): {item.get('PK')}")
         return
     
     # Extract date from item's createdAt for partitioning (use createdAt date, not current date)

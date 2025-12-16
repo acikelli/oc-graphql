@@ -120,8 +120,8 @@ The framework automatically generates and deploys:
 - **AppSync GraphQL API** with auto-generated resolvers and API key authentication
 - **Lambda Functions** (5-20+ functions depending on schema complexity) with optimized runtime and memory allocation
 - **DynamoDB Table** with optimized single-table design and DynamoDB Streams enabled
-- **S3 Data Lake** with Parquet storage, date partitioning, and automatic Glue table creation
-- **Athena Tables** with partition projection for ultra-fast queries
+- **S3 Data Lake** with Parquet storage and date partitioning
+- **Glue Tables** created automatically during deployment with partition projection for ultra-fast queries
 - **IAM Roles** with least-privilege security policies
 - **CloudWatch Logs** for comprehensive monitoring and debugging
 
@@ -134,10 +134,13 @@ The framework automatically generates and deploys:
 | Task Result Queries | 1 per Query field                   | Node.js 18.x | 256 MB     | 30 seconds  | Poll task results         | `OCG-api-query-taskResultReport`     |
 | Execution Tracker   | 1 per project (if tasks exist)      | Node.js 18.x | 256 MB     | 5 minutes   | Track Athena executions   | `OCG-api-athena-execution-tracker`   |
 | Stream Processor    | 1 per project                       | Python 3.11  | 1024 MB    | 5 minutes   | Real-time data pipeline   | `OCG-api-stream-processor`           |
-| Cascade Deletion    | 1 per project                       | Node.js 18.x | 256 MB     | 5 minutes   | Handle join table cleanup | `OCG-api-cascade-deletion-listener`  |
-| Deletion Listener   | 1 per project (if DELETE mutations) | Node.js 18.x | 256 MB     | 5 minutes   | Process DELETE operations | `OCG-api-deletion-listener`          |
+| Cascade Deletion    | 1 per project                       | Node.js 18.x | 512 MB     | 5 minutes   | Handle join table cleanup | `OCG-api-cascade-deletion-listener`  |
+| Deletion Listener   | 1 per project (if DELETE mutations) | Node.js 18.x | 512 MB     | 5 minutes   | Process DELETE operations | `OCG-api-deletion-listener`          |
 
-**Function Naming Pattern**: `OCG-{project}-{hash}` (hash is first 16 characters of SHA256 hash)
+**Function Naming Pattern**:
+
+- CRUD/Mutations/Tasks: `OCG-{project}-{hash}` (hash is first 16 characters of SHA256 hash)
+- Project-level functions: `OCG-{project}-{function-name}` (descriptive names, no hash)
 
 All functions are automatically configured with:
 
@@ -323,7 +326,3 @@ OC-GraphQL is open source and welcomes contributions! We're excited to have you 
 ## 📄 License
 
 MIT License - see [LICENSE](LICENSE) file for details.
-
----
-
-**Made with ❤️ by the OC-GraphQL team**

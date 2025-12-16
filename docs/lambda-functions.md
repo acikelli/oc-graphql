@@ -642,7 +642,7 @@ exports.handler = async (event) => {
 
 ### 6. Stream Processor (Python 3.11)
 
-Real-time DynamoDB to Parquet conversion with advanced optimization, join table support, and automatic Glue table management.
+Real-time DynamoDB to Parquet conversion with schema-based type enforcement, join table support, and optimized Parquet writing. **Glue tables are created during CDK deployment** - the stream processor only writes Parquet files.
 
 ```python
 # Pattern: OCG-{project}-stream-processor (no hash - created once per project)
@@ -664,10 +664,29 @@ logger.setLevel(logging.INFO)
 
 # Initialize AWS clients
 s3_client = boto3.client('s3')
-glue_client = boto3.client('glue')
+sqs_client = boto3.client('sqs')
 
 BUCKET_NAME = os.environ['S3_BUCKET_NAME']
-GLUE_DATABASE = os.environ['ATHENA_DATABASE_NAME']
+CASCADE_DELETION_QUEUE_URL = os.environ.get('CASCADE_DELETION_QUEUE_URL')
+TABLE_NAME = os.environ['DYNAMODB_TABLE_NAME']
+
+# Schema mapping from GraphQL types (injected during code generation)
+SCHEMA_MAPPING = {
+  "user": {
+    "id": "ID",
+    "name": "String",
+    "email": "String",
+    "password": "String",
+    "createdAt": "AWSDateTime",
+    "updatedAt": "AWSDateTime"
+  }
+}
+JOIN_TABLE_SCHEMAS = {
+  "user_favorite_products": {
+    "userId": "ID",
+    "productId": "ID"
+  }
+}
 
 def lambda_handler(event, context):
     """Main Lambda handler for DynamoDB stream processing"""
@@ -700,7 +719,7 @@ def process_record(record):
         logger.error(f"Error processing stream record: {str(e)}")
 
 def handle_delete_operation(record, current_date, year, month, day):
-    """Handle DELETE operations by removing Parquet files from S3 and triggering cascade deletion"""
+    """Handle DELETE operations by removing Parquet files and triggering cascade deletion"""
     if 'OldImage' not in record.get('dynamodb', {}):
         return
 
@@ -710,45 +729,37 @@ def handle_delete_operation(record, current_date, year, month, day):
     if not entity_type:
         return
 
-    # Determine S3 key for deletion with date partitioning
-    if item.get('joinTable'):
-        # Join table: use composite key from PK/SK
-        join_table = item['joinTable']
-        pk_parts = item['PK'].split('#')
-        sk_parts = item['SK'].split('#')
-        key_components = pk_parts[2:] + sk_parts[2:]
-        key_string = '_'.join(key_components)
+    # Skip task entities - they are metadata only and should not trigger S3 deletion
+    if entity_type == 'task':
+        logger.info(f"Skipping deletion of task entity (metadata only): {item.get('PK')}")
+        return
 
-        # Use original creation date for deletion
-        item_date = parse_item_date(item.get('createdAt'), current_date)
-        item_year, item_month, item_day = format_date_parts(item_date)
+    # Skip temporary joinTableData items - they are cleaned up after processing
+    if item.get('PK', '').startswith('joinTableData#'):
+        logger.info(f"Skipping deletion of temporary joinTableData item: {item.get('PK')}")
+        return
 
-        s3_key = f"tables/{join_table}/year={item_year}/month={item_month}/day={item_day}/{key_string}.parquet"
+    # Skip joinRelation items - their deletion is handled by cascade deletion
+    if item.get('entityType') == 'joinRelation':
+        logger.info(f"Skipping deletion of joinRelation metadata item: {item.get('PK')}")
+        return
 
-        logger.info(f"Deleting join table S3 object: {s3_key}")
+    # Regular entity deletion - delete S3 file and trigger cascade deletion
+    item_date = parse_item_date(item.get('createdAt'), current_date)
+    item_year, item_month, item_day = format_date_parts(item_date)
 
-        try:
-            s3_client.delete_object(Bucket=BUCKET_NAME, Key=s3_key)
-            logger.info(f"Successfully deleted join table S3 object: {s3_key}")
-        except Exception as e:
-            logger.warning(f"S3 object may not exist or already deleted: {s3_key} - {str(e)}")
-    else:
-        # Regular entity: use ID and trigger cascade deletion
-        item_date = parse_item_date(item.get('createdAt'), current_date)
-        item_year, item_month, item_day = format_date_parts(item_date)
+    s3_key = f"tables/{entity_type}/year={item_year}/month={item_month}/day={item_day}/{item['id']}.parquet"
 
-        s3_key = f"tables/{entity_type}/year={item_year}/month={item_month}/day={item_day}/{item['id']}.parquet"
+    logger.info(f"Deleting entity S3 object: {s3_key}")
 
-        logger.info(f"Deleting entity S3 object: {s3_key}")
+    try:
+        s3_client.delete_object(Bucket=BUCKET_NAME, Key=s3_key)
+        logger.info(f"Successfully deleted entity S3 object: {s3_key}")
+    except Exception as e:
+        logger.warning(f"S3 object may not exist or already deleted: {s3_key} - {str(e)}")
 
-        try:
-            s3_client.delete_object(Bucket=BUCKET_NAME, Key=s3_key)
-            logger.info(f"Successfully deleted entity S3 object: {s3_key}")
-        except Exception as e:
-            logger.warning(f"S3 object may not exist or already deleted: {s3_key} - {str(e)}")
-
-        # Send message to SQS for cascade deletion of join relations
-        send_cascade_deletion_message(entity_type, item.get('id'))
+    # Send message to SQS for cascade deletion of join relations
+    send_cascade_deletion_message(entity_type, item.get('id'))
 
 def handle_insert_update_operation(record, event_name, current_date, year, month, day):
     """Handle INSERT and MODIFY operations by creating/updating Parquet files"""
@@ -762,20 +773,71 @@ def handle_insert_update_operation(record, event_name, current_date, year, month
     if not entity_type:
         return
 
+    # Skip task entities - they are metadata only and should not be written to Parquet
+    if entity_type == 'task':
+        logger.info(f"Skipping task entity (metadata only): {item.get('PK')}")
+        return
+
+    # Extract date from item's createdAt for partitioning (use createdAt date, not current date)
+    # This ensures updates go to the same partition as the original creation
+    item_date = parse_item_date(item.get('createdAt'), current_date)
+    item_year, item_month, item_day = format_date_parts(item_date)
+
     # Add processing metadata
     item['_processing_timestamp'] = current_date.isoformat()
     item['_event_name'] = event_name
-    item['_partition_year'] = year
-    item['_partition_month'] = month
-    item['_partition_day'] = day
+    item['_partition_year'] = item_year
+    item['_partition_month'] = item_month
+    item['_partition_day'] = item_day
 
-    if item.get('joinTable'):
-        handle_join_table_item(item, year, month, day, event_name)
+    # Check if this is a join table data item (joinTableData#relationId)
+    if item.get('PK', '').startswith('joinTableData#'):
+        handle_join_table_data_item(item, item_year, item_month, item_day, event_name)
+    elif item.get('joinTable'):
+        # Legacy join table item (for backwards compatibility)
+        handle_legacy_join_table_item(item, item_year, item_month, item_day, event_name)
     else:
-        handle_regular_entity_item(item, entity_type, year, month, day, event_name)
+        handle_regular_entity_item(item, entity_type, item_year, item_month, item_day, event_name)
 
-def handle_join_table_item(item, year, month, day, event_name):
-    """Handle join table items (many-to-many relationships) with date partitioning"""
+def handle_join_table_data_item(item, year, month, day, event_name):
+    """Handle join table data items using relationId as filename"""
+    join_table = item.get('joinTableName') or item.get('joinTable')
+    relation_id = item.get('relationId')
+
+    if not relation_id:
+        logger.warning(f"Join table item missing relationId: {item}")
+        return
+
+    if not join_table:
+        logger.warning(f"Join table item missing joinTableName: {item}")
+        return
+
+    s3_key = f"tables/{join_table}/year={year}/month={month}/day={day}/{relation_id}.parquet"
+
+    logger.info(f"Processing join table data item for '{join_table}' with relationId '{relation_id}' - {event_name}")
+
+    # Convert to DataFrame and write as Parquet
+    df = create_dataframe_from_item(item, join_table_name=join_table)
+    write_parquet_to_s3(df, s3_key)
+
+    # Glue tables are now created during CDK deployment, no need to check/create here
+    # This eliminates expensive S3 ListBucket operations
+
+    # Delete the temporary joinTableData item after processing
+    try:
+        import boto3.dynamodb.conditions as conditions
+        dynamodb_resource = boto3.resource('dynamodb')
+        table = dynamodb_resource.Table(TABLE_NAME)
+        table.delete_item(
+            Key={'PK': item['PK'], 'SK': item['SK']},
+            ConditionExpression='attribute_exists(PK)'
+        )
+        logger.info(f"Successfully deleted temporary joinTableData item: {item['PK']}")
+    except Exception as e:
+        logger.error(f"Error deleting temporary joinTableData item {item['PK']}: {e}")
+
+def handle_legacy_join_table_item(item, year, month, day, event_name):
+    """Handle legacy join table items (for backwards compatibility)"""
     join_table = item['joinTable']
     pk_parts = item['PK'].split('#')
     sk_parts = item['SK'].split('#')
@@ -784,73 +846,101 @@ def handle_join_table_item(item, year, month, day, event_name):
     key_string = '_'.join(key_components)
 
     s3_key = f"tables/{join_table}/year={year}/month={month}/day={day}/{key_string}.parquet"
-    table_location = f"s3://{BUCKET_NAME}/tables/{join_table}/"
-    athena_table_name = join_table
 
-    logger.info(f"Processing join table item for '{join_table}' - {event_name}")
+    logger.info(f"Processing legacy join table item for '{join_table}' - {event_name}")
 
     # Convert to DataFrame and write as Parquet
-    df = create_dataframe_from_item(item)
+    df = create_dataframe_from_item(item, join_table_name=join_table)
     write_parquet_to_s3(df, s3_key)
 
-    # Ensure Glue table exists with Parquet format
-    ensure_optimized_glue_table(athena_table_name, table_location, item, df)
+    # Glue tables are now created during CDK deployment, no need to check/create here
 
 def handle_regular_entity_item(item, entity_type, year, month, day, event_name):
     """Handle regular entity items with date partitioning"""
     s3_key = f"tables/{entity_type}/year={year}/month={month}/day={day}/{item['id']}.parquet"
-    table_location = f"s3://{BUCKET_NAME}/tables/{entity_type}/"
-    athena_table_name = entity_type
 
     logger.info(f"Processing regular entity item for '{entity_type}' - {event_name}")
 
     # Convert to DataFrame and write as Parquet
-    df = create_dataframe_from_item(item)
+    df = create_dataframe_from_item(item, entity_type=entity_type)
     write_parquet_to_s3(df, s3_key)
 
-    # Ensure Glue table exists with Parquet format
-    ensure_optimized_glue_table(athena_table_name, table_location, item, df)
+    # Glue tables are now created during CDK deployment, no need to check/create here
+    # This eliminates expensive S3 ListBucket operations
 
-def create_dataframe_from_item(item):
-    """Convert DynamoDB item to pandas DataFrame with intelligent type optimization"""
+def create_dataframe_from_item(item, entity_type=None, join_table_name=None):
+    """Convert DynamoDB item to pandas DataFrame with proper type handling based on GraphQL schema"""
     df = pd.DataFrame([item])
 
-    # Optimize data types with proper timestamp handling
+    # Determine which schema to use
+    schema = None
+    if join_table_name:
+        schema = JOIN_TABLE_SCHEMAS.get(join_table_name.lower(), {})
+    elif entity_type:
+        schema = SCHEMA_MAPPING.get(entity_type.lower(), {})
+
+    # Optimize data types based on GraphQL schema types
     for column in df.columns:
         if column.startswith('_partition_'):
             continue
 
-        # Only handle timestamp fields if they are actual ISO 8601 timestamps (AWSDateTime)
-        if (isinstance(df[column].iloc[0], str) and is_iso_timestamp(df[column].iloc[0])):
+        # Get expected type from schema
+        expected_type = None
+        if schema and column in schema:
+            expected_type = schema[column]
+
+        # Handle timestamp fields (AWSDateTime)
+        if expected_type == 'AWSDateTime' or (expected_type is None and isinstance(df[column].iloc[0], str) and is_iso_timestamp(df[column].iloc[0])):
             try:
-                # Convert ISO 8601 timestamp to pandas datetime with UTC timezone
                 df[column] = pd.to_datetime(df[column], format='mixed', utc=True)
                 logger.info(f"Converted AWSDateTime field '{column}' to datetime")
             except Exception as e:
                 logger.warning(f"Failed to convert timestamp field '{column}': {e}")
                 df[column] = df[column].astype('string')
 
-        # Optimize numeric types
-        elif df[column].dtype == 'object':
+        # Handle String/ID types - must stay as string even if numeric-looking
+        elif expected_type in ['String', 'ID']:
+            df[column] = df[column].astype('string')
+            logger.debug(f"Enforcing String type for '{column}'")
+
+        # Handle Int types
+        elif expected_type == 'Int':
             try:
-                numeric_series = pd.to_numeric(df[column], errors='ignore')
-                if not numeric_series.equals(df[column]):
-                    if numeric_series.dtype == 'int64':
-                        df[column] = numeric_series.astype('int32')
-                    elif numeric_series.dtype == 'float64':
-                        df[column] = numeric_series.astype('float32')
-                    else:
-                        df[column] = numeric_series
-                else:
-                    df[column] = df[column].astype('string')
-            except:
+                numeric_series = pd.to_numeric(df[column], errors='coerce', downcast='integer')
+                df[column] = numeric_series.astype('int32')
+            except Exception as e:
+                logger.warning(f"Failed to convert Int field '{column}': {e}")
                 df[column] = df[column].astype('string')
 
-        # Convert other types to minimal representations
-        elif df[column].dtype == 'int64':
-            df[column] = df[column].astype('int32')
-        elif df[column].dtype == 'float64':
-            df[column] = df[column].astype('float32')
+        # Handle Float types
+        elif expected_type == 'Float':
+            try:
+                numeric_series = pd.to_numeric(df[column], errors='coerce', downcast='float')
+                df[column] = numeric_series.astype('float32')
+            except Exception as e:
+                logger.warning(f"Failed to convert Float field '{column}': {e}")
+                df[column] = df[column].astype('string')
+
+        # Handle Boolean types
+        elif expected_type == 'Boolean':
+            df[column] = df[column].astype('bool')
+
+        # If no schema type found, infer from data (fallback for backwards compatibility)
+        elif expected_type is None:
+            if df[column].dtype == 'object':
+                if isinstance(df[column].iloc[0], str) and is_iso_timestamp(df[column].iloc[0]):
+                    try:
+                        df[column] = pd.to_datetime(df[column], format='mixed', utc=True)
+                    except:
+                        df[column] = df[column].astype('string')
+                else:
+                    df[column] = df[column].astype('string')
+            elif df[column].dtype == 'bool':
+                df[column] = df[column].astype('bool')
+            elif df[column].dtype == 'int64':
+                df[column] = df[column].astype('int32')
+            elif df[column].dtype == 'float64':
+                df[column] = df[column].astype('float32')
 
     return df
 
@@ -928,98 +1018,23 @@ def write_parquet_to_s3(df, s3_key):
         logger.error(f"Error writing Parquet to S3: {str(e)}")
         raise
 
-def ensure_optimized_glue_table(table_name, location, sample_item, df):
-    """Create or update Glue table with Parquet format and partition projection"""
-    try:
-        glue_client.get_table(DatabaseName=GLUE_DATABASE, Name=table_name)
-        logger.info(f"Table '{table_name}' already exists")
+def send_cascade_deletion_message(entity_type, entity_id):
+    """Send message to SQS queue for cascade deletion"""
+    if not CASCADE_DELETION_QUEUE_URL:
+        logger.warning("CASCADE_DELETION_QUEUE_URL not set, skipping cascade deletion")
         return
-    except glue_client.exceptions.EntityNotFoundException:
-        logger.info(f"Creating new Parquet table: {table_name}")
-        create_parquet_glue_table(table_name, location, sample_item, df)
 
-def create_parquet_glue_table(table_name, location, sample_item, df):
-    """Create optimized Parquet Glue table with partition projection"""
-    # Generate columns from DataFrame dtypes (more accurate than sample item)
-    columns = []
-    for column_name in df.columns:
-        if column_name.startswith('_partition_'):
-            continue
-
-        column_type = infer_glue_type_from_dataframe(df, column_name)
-        columns.append({
-            'Name': column_name,
-            'Type': column_type
-        })
-
-    # Add partition columns
-    partition_keys = [
-        {'Name': 'year', 'Type': 'string'},
-        {'Name': 'month', 'Type': 'string'},
-        {'Name': 'day', 'Type': 'string'}
-    ]
-
-    # Build storage template for partition projection
-    storage_template = f"{location}year=${{year}}/month=${{month}}/day=${{day}}/"
-
-    # Create Parquet table with partition projection
-    glue_client.create_table(
-        DatabaseName=GLUE_DATABASE,
-        TableInput={
-            'Name': table_name,
-            'Description': f'Optimized Parquet table for {table_name} with SNAPPY compression',
-            'PartitionKeys': partition_keys,
-            'StorageDescriptor': {
-                'Columns': columns,
-                'Location': location,
-                'InputFormat': 'org.apache.hadoop.hive.ql.io.parquet.MapredParquetInputFormat',
-                'OutputFormat': 'org.apache.hadoop.hive.ql.io.parquet.MapredParquetOutputFormat',
-                'SerdeInfo': {
-                    'SerializationLibrary': 'org.apache.hadoop.hive.ql.io.parquet.serde.ParquetHiveSerDe'
-                },
-                'Parameters': {
-                    'parquet.compression': 'SNAPPY',
-                    'classification': 'parquet'
-                }
-            },
-            'TableType': 'EXTERNAL_TABLE',
-            'Parameters': {
-                'EXTERNAL': 'TRUE',
-                'parquet.compression': 'SNAPPY',
-                'projection.enabled': 'true',
-                'projection.year.type': 'integer',
-                'projection.year.range': '2024,2030',
-                'projection.month.type': 'integer',
-                'projection.month.range': '1,12',
-                'projection.month.digits': '2',
-                'projection.day.type': 'integer',
-                'projection.day.range': '1,31',
-                'projection.day.digits': '2',
-                'storage.location.template': storage_template,
-                'has_encrypted_data': 'false',
-                'typeOfData': 'file'
-            }
-        }
-    )
-
-    logger.info(f"Successfully created Parquet table '{table_name}' with partition projection")
-
-def infer_glue_type_from_dataframe(df, column_name):
-    """Infer Glue data type from DataFrame column dtype"""
-    column_dtype = df[column_name].dtype
-
-    if pd.api.types.is_datetime64_any_dtype(column_dtype):
-        return 'timestamp'
-    elif pd.api.types.is_bool_dtype(column_dtype):
-        return 'boolean'
-    elif pd.api.types.is_integer_dtype(column_dtype):
-        return 'bigint'
-    elif pd.api.types.is_float_dtype(column_dtype):
-        return 'double'
-    elif pd.api.types.is_string_dtype(column_dtype) or column_dtype == 'object':
-        return 'string'
-    else:
-        return 'string'
+    try:
+        sqs_client.send_message(
+            QueueUrl=CASCADE_DELETION_QUEUE_URL,
+            MessageBody=json.dumps({
+                'entityType': entity_type,
+                'entityId': entity_id
+            })
+        )
+        logger.info(f"Sent cascade deletion message for {entity_type}#{entity_id}")
+    except Exception as e:
+        logger.error(f"Error sending cascade deletion message: {e}")
 
 def unmarshall_dynamodb_item(dynamodb_item):
     """Convert DynamoDB item format to regular Python dict"""
@@ -1075,21 +1090,19 @@ def format_date_parts(date_obj):
 **Key Features:**
 
 - **Full CRUD Support**: Handles INSERT, MODIFY, and REMOVE operations
-- **Join Table Support**: Automatically handles many-to-many relationship tables
-- **Intelligent Type Detection**: Converts ISO 8601 timestamps to native datetime, optimizes numeric types
-- **Automatic Glue Table Creation**: Creates Parquet tables with partition projection for optimal query performance
-- **Date Partitioning**: Organizes data by year/month/day for efficient query pruning
+- **Schema-Based Type Enforcement**: Uses GraphQL schema types to ensure correct Parquet column types (prevents type mismatches)
+- **Join Table Support**: Automatically handles many-to-many relationship tables with `joinTableData` items
+- **Task Entity Skipping**: Skips task entities (metadata only) - they are not written to Parquet
+- **Date Partitioning**: Uses `createdAt` date for partitioning to ensure updates go to the same partition as creation
+- **Automatic Cleanup**: Deletes temporary `joinTableData` items after processing
 - **Ultra-Minimal Parquet Schema**: Uses smallest possible data types for maximum compression
 - **Error Resilience**: Continues processing other records if one fails
 - **Cascade Deletion**: Sends SQS messages for entity deletions to trigger join table cleanup
+- **No Glue API Calls**: Glue tables are created during CDK deployment - eliminates expensive S3 ListBucket operations
 
 ### 7. Cascade Deletion Listener (Node.js 18.x)
 
 SQS queue listener that automatically cleans up join table relations and S3 files when entities are deleted.
-
-### 10. Deletion Listener (Node.js 18.x)
-
-Processes deletion tasks for DELETE SQL operations. Retrieves query results from Athena and deletes S3 Parquet files.
 
 ```javascript
 // Pattern: OCG-{project}-cascade-deletion-listener (no hash - created once per project)
@@ -1163,11 +1176,12 @@ exports.handler = async (event) => {
 **Key Features:**
 
 - **SQS Integration**: Listens to cascade deletion queue for entity deletion events
+- **GSI1 Query**: Uses GSI1 to efficiently find all `joinRelation` items for each `relationId`
 - **Bulk S3 Deletion**: Efficiently deletes up to 1000 S3 objects per request
-- **Automatic Cleanup**: Removes both S3 Parquet files and DynamoDB joinRelation items
+- **Complete Cleanup**: Removes both S3 Parquet files, DynamoDB `joinRelation` items, and `joinTableData` items
 - **Error Resilience**: Continues processing even if individual deletions fail
 
-### 10. Deletion Listener (Node.js 18.x)
+### 8. Deletion Listener (Node.js 18.x)
 
 Processes deletion tasks for DELETE SQL operations. Retrieves query results from Athena and performs complete cleanup of both DynamoDB items and S3 Parquet files.
 
@@ -1389,7 +1403,6 @@ This automatically generates:
 | Task Mutations            | Node.js 18.x | 256 MB     | 30 seconds  | 100             |
 | Task Result Queries       | Node.js 18.x | 256 MB     | 30 seconds  | 100             |
 | Execution Tracker         | Node.js 18.x | 256 MB     | 5 minutes   | 100             |
-| Resolvers                 | Node.js 18.x | 512 MB     | 5 minutes   | 100             |
 | Stream Processor          | Python 3.11  | 1024 MB    | 5 minutes   | 10              |
 | Cascade Deletion Listener | Node.js 18.x | 512 MB     | 5 minutes   | 10              |
 | Deletion Listener         | Node.js 18.x | 512 MB     | 5 minutes   | 10              |
@@ -1404,8 +1417,11 @@ S3_BUCKET_NAME=ocg-{project}-{account-id}
 ATHENA_DATABASE_NAME={project}_db
 ATHENA_OUTPUT_LOCATION=s3://ocg-{project}-athena-results-{account-id}/query-results/
 CASCADE_DELETION_QUEUE_URL=https://sqs.{region}.amazonaws.com/{account}/{project}-cascade-deletion
+DELETION_QUEUE_URL=https://sqs.{region}.amazonaws.com/{account}/{project}-deletion
 AWS_REGION={region}
 ```
+
+**Note:** `DELETION_QUEUE_URL` is only set for functions that handle deletion tasks (execution tracker and deletion listener).
 
 ### IAM Permissions
 
@@ -1449,17 +1465,18 @@ AWS_REGION={region}
     "s3:PutObject",
     "s3:DeleteObject",
     "s3:GetObject",
-    "glue:CreateTable",
-    "glue:GetTable",
+    "dynamodb:DeleteItem",
     "sqs:SendMessage"
   ],
   "Resource": [
     "arn:aws:s3:::{project}-{account}/*",
-    "arn:aws:glue:{region}:{account}:*",
+    "arn:aws:dynamodb:{region}:{account}:table/OCG-{project}",
     "arn:aws:sqs:{region}:{account}:{project}-cascade-deletion"
   ]
 }
 ```
+
+**Note:** Glue permissions are no longer needed - Glue tables are created during CDK deployment, not by the stream processor. This eliminates expensive S3 ListBucket operations.
 
 #### Cascade Deletion Listener
 

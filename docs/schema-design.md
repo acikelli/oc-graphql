@@ -511,7 +511,7 @@ type Query {
 
 ### 4. `@return` - Static Value Returns
 
-**Note:** `@return` directive is deprecated. It was previously used with `@resolver` types, which are no longer supported. Use `@sql_query` on Query/Mutation fields instead.
+**Note:** `@return` directive is deprecated and no longer supported. All SQL queries must be defined using `@sql_query` on Query/Mutation fields.
 
 ## 🏗️ Schema Structure Patterns
 
@@ -681,38 +681,8 @@ type Mutation {
     )
 }
 
-type User {
-  # Follower analytics
-  followerCount: Int!
-    @sql_query(
-      query: "SELECT COUNT(*) as count FROM user_follows WHERE following_id = $source.id"
-    )
-  followingCount: Int!
-    @sql_query(
-      query: "SELECT COUNT(*) as count FROM user_follows WHERE follower_id = $source.id"
-    )
-
-  # Relationship queries
-  followers(limit: Int = 10): [User!]!
-    @sql_query(
-      query: """
-      SELECT u.* FROM user u
-      JOIN user_follows uf ON u.id = uf.follower_id
-      WHERE uf.following_id = $source.id
-      LIMIT $args.limit
-      """
-    )
-
-  following(limit: Int = 10): [User!]!
-    @sql_query(
-      query: """
-      SELECT u.* FROM user u
-      JOIN user_follows uf ON u.id = uf.following_id
-      WHERE uf.follower_id = $source.id
-      LIMIT $args.limit
-      """
-    )
-}
+# Note: Field-level @sql_query is no longer supported
+# All SQL queries must be defined on Query or Mutation root types
 ```
 
 ## 📊 Parameter Handling
@@ -721,7 +691,7 @@ type User {
 
 #### `$args` - GraphQL Arguments
 
-Access field arguments in SQL queries.
+Access field arguments in SQL queries. **This is the only supported parameter type** - `$source` is no longer supported since field-level `@sql_query` directives are not allowed.
 
 ```graphql
 type Query {
@@ -733,24 +703,6 @@ type Query {
         AND ($args.city IS NULL OR city = $args.city)
         AND ($args.minAge IS NULL OR age >= $args.minAge)
       ORDER BY name
-      """
-    )
-}
-```
-
-#### `$source` - Parent Object Data
-
-Access parent object fields in nested resolvers.
-
-```graphql
-type User {
-  recentPosts(days: Int = 7): [Post!]!
-    @sql_query(
-      query: """
-      SELECT * FROM post
-      WHERE user_id = $source.id
-        AND created_at >= NOW() - INTERVAL '$args.days days'
-      ORDER BY created_at DESC
       """
     )
 }
@@ -786,13 +738,14 @@ type User {
   id: ID!
   email: String!
 
-  # Computed fields (efficient SQL)
-  postCount: Int!
-    @sql_query(query: "SELECT COUNT(*) FROM post WHERE user_id = $source.id")
-
-  # Complex relationships (resolver types)
-  posts: UserPostConnection!
-  analytics: UserAnalytics!
+  # Note: Field-level @sql_query is no longer supported
+  # All SQL queries must be defined on Query or Mutation root types
+  # For computed fields, define them as Query fields:
+  #
+  # type Query {
+  #   getUserPostCount(userId: ID!): Int!
+  #     @sql_query(query: "SELECT COUNT(*) FROM post WHERE user_id = $args.userId")
+  # }
 }
 ```
 

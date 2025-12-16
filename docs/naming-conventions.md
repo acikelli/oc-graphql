@@ -206,17 +206,17 @@ Examples:
 - readPostResolver
 - updateCommentResolver
 
-Query Resolvers:
-Pattern: {queryName}Resolver
+Task Trigger Mutations:
+Pattern: triggerTask{QueryName}Resolver
 Examples:
-- getPublishedPostsResolver
-- searchUsersResolver
+- triggerTaskGetUsersByCityResolver
+- triggerTaskGenerateReportResolver
 
-Field Resolvers:
-Pattern: {EntityName}{fieldName}Resolver
+Task Result Queries:
+Pattern: taskResult{QueryName}Resolver
 Examples:
-- UserpostsResolver
-- PostlikeCountResolver
+- taskResultGetUsersByCityResolver
+- taskResultGenerateReportResolver
 ```
 
 ### IAM Resources

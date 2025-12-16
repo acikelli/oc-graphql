@@ -67,7 +67,7 @@ DynamoDB → Streams → Python Processor → Parquet Files → Athena Tables
 **Features:**
 
 - Automatic CRUD operations generation
-- Custom resolver attachment
+- Task-based query execution (all Query fields are automatically tasks)
 - Real-time subscriptions support
 - API key authentication
 - Request/response caching
@@ -78,7 +78,8 @@ DynamoDB → Streams → Python Processor → Parquet Files → Athena Tables
 // Auto-generated for each entity type
 Query.readUser → Lambda → DynamoDB.GetItem
 Mutation.createUser → Lambda → DynamoDB.PutItem
-User.posts → Lambda → Athena.Query
+Mutation.triggerTaskGetUsersByCity → Lambda → Athena.StartQueryExecution
+Query.taskResultGetUsersByCity → Lambda → Athena.GetQueryResults
 ```
 
 ### Lambda Functions Architecture
@@ -104,22 +105,20 @@ Examples:
 - OCG-blog-query-searchUsers
 ```
 
-#### 3. **Resolver Functions** (Node.js 18.x)
+#### 3. **Task Trigger Mutations** (Node.js 18.x)
 
 ```
-Pattern: OCG-{project}-resolver-{typeName}
+Pattern: OCG-{project}-{hash} (hash from: {project}-mutation-triggerTask{QueryName})
 Examples:
-- OCG-blog-resolver-postconnection
-- OCG-blog-resolver-useranalytics
+- OCG-blog-{hash} (for blog-mutation-triggerTaskGetUsersByCity)
 ```
 
-#### 4. **Field Resolver Functions** (Node.js 18.x)
+#### 4. **Task Result Queries** (Node.js 18.x)
 
 ```
-Pattern: OCG-{project}-field-{typeName}-{fieldName}
+Pattern: OCG-{project}-{hash} (hash from: {project}-query-taskResult{QueryName})
 Examples:
-- OCG-blog-field-user-totalPosts
-- OCG-blog-field-post-likeCount
+- OCG-blog-{hash} (for blog-query-taskResultGetUsersByCity)
 ```
 
 #### 5. **Stream Processor** (Python 3.11)
@@ -201,11 +200,14 @@ DynamoDB Event → Python Lambda → Parquet Processing → S3 Upload
 #### Processing Logic
 
 1. **Event Detection**: INSERT, MODIFY, REMOVE operations
-2. **Data Transformation**: DynamoDB → pandas DataFrame
-3. **Type Optimization**: Automatic data type inference
-4. **Parquet Generation**: PyArrow with SNAPPY compression
-5. **S3 Upload**: Partitioned storage with metadata
-6. **Glue Integration**: Automatic table creation/updates
+2. **Entity Filtering**: Skips task entities (metadata only)
+3. **Data Transformation**: DynamoDB → pandas DataFrame with schema-based type enforcement
+4. **Type Enforcement**: Uses GraphQL schema types to ensure correct Parquet column types
+5. **Parquet Generation**: PyArrow with SNAPPY compression
+6. **S3 Upload**: Partitioned storage using `createdAt` date for consistency
+7. **Automatic Cleanup**: Deletes temporary `joinTableData` items after processing
+
+**Note:** Glue tables are created during CDK deployment, not by the stream processor. This eliminates expensive S3 ListBucket operations.
 
 #### Supported Operations
 
