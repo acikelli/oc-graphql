@@ -14,6 +14,13 @@ OC-GraphQL extends GraphQL with powerful custom directives that enable automatic
 
 ## 📋 Custom Directives
 
+OC-GraphQL supports the following custom directives:
+
+- **`@sql_query`**: Execute SQL queries on Query/Mutation fields (required)
+- **`@task_response`**: Mark types as task response types (required for Query field return types)
+
+**Important:** The `@resolver` directive and field-level `@sql_query` directives are no longer supported. All SQL queries must be defined as Query or Mutation fields.
+
 ### 1. `@sql_query` - Direct SQL Integration
 
 Execute SQL queries directly within GraphQL resolvers. **Can only be used on Query and Mutation fields**, not on type fields.
@@ -542,9 +549,10 @@ INSERT INTO $join_table(table_name) (userId:User, productId:Product) VALUES ($ar
 **How it works:**
 
 - The framework extracts entity types (`User`, `Product`, etc.) from the column definitions
-- A **deterministic `relationId`** is generated from the entity mappings (sorted alphabetically by entity type and value, then hashed using SHA-256)
+- A **deterministic `relationId`** is generated from the table name and entity mappings (sorted alphabetically by entity type and value, then hashed using SHA-256)
   - This ensures that duplicate inserts with the same values return the existing relation instead of creating a new one
-  - Format: `entityType1:value1|entityType2:value2|...` (sorted) → SHA-256 hash (first 32 chars)
+  - The table name is included in the hash to prevent collisions across different join tables with the same entity mappings
+  - Format: `tableName|entityType1:value1|entityType2:value2|...` (sorted) → SHA-256 hash (first 32 chars)
 - Before creating a new relation, the system checks if `joinTableData#<relationId>` already exists
   - If it exists, returns the existing data (prevents duplicates)
   - If it doesn't exist, creates a new relation
@@ -583,7 +591,8 @@ When this mutation is called:
 
 1. Entity mappings are extracted: `[{entityType: "User", value: userId}, {entityType: "Product", value: productId}]`
 2. Mappings are sorted alphabetically: `[{entityType: "Product", value: productId}, {entityType: "User", value: userId}]`
-3. A deterministic `relationId` is generated: `SHA-256("product:<productId>|user:<userId>")` → first 32 chars (e.g., `"a1b2c3d4e5f6..."`)
+3. A deterministic `relationId` is generated: `SHA-256("user_favorite_products|product:<productId>|user:<userId>")` → first 32 chars (e.g., `"a1b2c3d4e5f6..."`)
+   - The table name is included to prevent collisions if the same entity mappings are used in different join tables
 4. The system checks if `joinTableData#<relationId>` already exists:
    - **If exists**: Returns the existing relation data (prevents duplicate inserts)
    - **If not exists**: Proceeds with creating a new relation
@@ -808,13 +817,13 @@ type Query {
 ### 3. Error Handling
 
 ```graphql
-# Provide sensible defaults
-type UserAnalytics @resolver {
-  avgPostLength: Float!
+# Provide sensible defaults with COALESCE
+type Query {
+  getUserAvgPostLength(userId: ID!): Float!
     @sql_query(
       query: """
       SELECT COALESCE(AVG(LENGTH(content)), 0) as avg_length
-      FROM post WHERE user_id = $source.id
+      FROM post WHERE user_id = $args.userId
       """
     )
 }
@@ -837,6 +846,7 @@ type User {
 
 ```graphql
 # Entities (Auto-CRUD)
+# Entities (Auto-CRUD)
 type User {
   id: ID!
   email: String!
@@ -845,20 +855,6 @@ type User {
   city: String
   createdAt: AWSDateTime!
   updatedAt: AWSDateTime!
-
-  # Field resolvers
-  postCount: Int!
-    @sql_query(
-      query: "SELECT COUNT(*) as count FROM post WHERE user_id = $source.id"
-    )
-
-  # Relationships
-  posts(
-    limit: Int = 10
-    offset: Int = 0
-    published: Boolean
-  ): UserPostConnection!
-  analytics: UserAnalytics!
 }
 
 type Post {
@@ -870,66 +866,37 @@ type Post {
   tags: [String!]
   createdAt: AWSDateTime!
   updatedAt: AWSDateTime!
-
-  # Analytics
-  likeCount: Int!
-    @sql_query(
-      query: "SELECT COUNT(*) as count FROM post_likes WHERE post_id = $source.id"
-    )
-  viewCount: Int!
-    @sql_query(
-      query: "SELECT COALESCE(view_count, 0) FROM post_views WHERE post_id = $source.id"
-    )
 }
 
-# Resolver Types
-type UserPostConnection @resolver {
-  items: [Post!]!
-    @sql_query(
-      query: """
-      SELECT * FROM post
-      WHERE user_id = $source.id
-      AND ($args.published IS NULL OR published = $args.published)
-      ORDER BY created_at DESC
-      LIMIT $args.limit OFFSET $args.offset
-      """
-    )
-
-  totalCount: Int!
-    @sql_query(
-      query: """
-      SELECT COUNT(*) as count FROM post
-      WHERE user_id = $source.id
-      AND ($args.published IS NULL OR published = $args.published)
-      """
-    )
-
-  hasMore: Boolean! @return(value: "$args.offset + $args.limit < totalCount")
-}
-
-type UserAnalytics @resolver {
+# Analytics response type (for Query fields)
+type UserAnalytics @task_response {
   totalPosts: Int!
-    @sql_query(
-      query: "SELECT COUNT(*) as count FROM post WHERE user_id = $source.id"
-    )
   totalLikes: Int!
-    @sql_query(
-      query: "SELECT COUNT(*) as count FROM post_likes pl JOIN post p ON pl.post_id = p.id WHERE p.user_id = $source.id"
-    )
   avgEngagement: Float!
-    @sql_query(
-      query: "SELECT AVG(like_count + comment_count) FROM post_stats WHERE user_id = $source.id"
-    )
   topTags: [String!]!
-    @sql_query(
-      query: "SELECT tag FROM post_tags pt JOIN post p ON pt.post_id = p.id WHERE p.user_id = $source.id GROUP BY tag ORDER BY COUNT(*) DESC LIMIT 5"
-    )
 }
 
-# Queries
+# Queries (all Query fields are automatically tasks)
 type Query {
   # Auto-generated CRUD
   readUser(id: ID!): User
+
+  # User analytics query (automatically becomes a task)
+  getUserAnalytics(userId: ID!): UserAnalytics!
+    @sql_query(
+      query: """
+      SELECT
+        COUNT(DISTINCT p.id) as totalPosts,
+        COUNT(DISTINCT pl.id) as totalLikes,
+        AVG(p.like_count + p.comment_count) as avgEngagement,
+        ARRAY_AGG(DISTINCT pt.tag) FILTER (WHERE pt.tag IS NOT NULL) as topTags
+      FROM post p
+      LEFT JOIN post_likes pl ON p.id = pl.post_id
+      LEFT JOIN post_tags pt ON p.id = pt.post_id
+      WHERE p.user_id = $args.userId
+      GROUP BY p.user_id
+      """
+    )
 
   # Custom analytics
   getPopularPosts(days: Int = 7, limit: Int = 10): [Post!]!

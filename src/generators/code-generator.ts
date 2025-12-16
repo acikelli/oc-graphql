@@ -437,9 +437,10 @@ exports.handler = async (event) => {
           return a.value.localeCompare(b.value);
         });
         
-        // Create deterministic ID: entityType1:value1|entityType2:value2|...
+        // Create deterministic ID: tableName|entityType1:value1|entityType2:value2|...
+        // Include table name to prevent collisions across different join tables with same entity mappings
         const relationIdParts = sortedMappings.map(m => \`\${m.entityType.toLowerCase()}:\${m.value}\`);
-        const relationIdString = relationIdParts.join('|');
+        const relationIdString = \`\${tableName}|\${relationIdParts.join('|')}\`;
         
         // Use crypto to create a deterministic hash (SHA-256, then take first 32 chars)
         const crypto = require('crypto');
@@ -557,13 +558,94 @@ exports.handler = async (event) => {
   // Removed: generateResolverFunction - @resolver directive no longer supported
 
   private generateStreamProcessor(): string {
+    // Build schema mapping: entityType -> { fieldName -> GraphQL type }
+    const schemaMapping: Record<string, Record<string, string>> = {};
+
+    for (const type of this.schemaMetadata.types) {
+      if (!type.isPrimitive && !type.isTaskResponse) {
+        const entityType = type.name.toLowerCase();
+        schemaMapping[entityType] = {};
+
+        for (const field of type.fields) {
+          // Skip internal fields
+          if (
+            field.name === "PK" ||
+            field.name === "SK" ||
+            field.name === "GSI1-PK" ||
+            field.name === "GSI1-SK" ||
+            field.name === "entityType" ||
+            field.name === "entityId" ||
+            field.name.startsWith("_partition_")
+          ) {
+            continue;
+          }
+
+          // Store the GraphQL type (remove list and non-null markers for base type)
+          const baseType = field.type.replace(/[\[\]!]/g, "").trim();
+          schemaMapping[entityType][field.name] = baseType;
+        }
+      }
+    }
+
+    // Also build schema mapping for join tables from mutations
+    const joinTableSchemas: Record<string, Record<string, string>> = {};
+    for (const mutation of this.schemaMetadata.mutations) {
+      if (mutation.sqlQuery?.query) {
+        const query = mutation.sqlQuery.query;
+        const joinTableMatch = query.match(/\$join_table\(([^)]+)\)/);
+        if (joinTableMatch) {
+          const tableName = joinTableMatch[1].toLowerCase();
+          if (!joinTableSchemas[tableName]) {
+            joinTableSchemas[tableName] = {};
+          }
+
+          // Extract column definitions from INSERT statement
+          const insertMatch = query.match(
+            /INSERT\s+INTO\s+\$join_table\([^)]+\)\s*\(([^)]+)\)/i
+          );
+          if (insertMatch) {
+            const columnDefs = insertMatch[1]
+              .split(",")
+              .map((col) => col.trim());
+            for (const colDef of columnDefs) {
+              const parts = colDef.split(":");
+              if (parts.length === 2) {
+                const columnName = parts[0].trim();
+                // Find the column type from mutation arguments
+                const arg = mutation.arguments?.find(
+                  (a) => a.name === columnName
+                );
+                if (arg) {
+                  const baseType = arg.type.replace(/[\[\]!]/g, "").trim();
+                  joinTableSchemas[tableName][columnName] = baseType;
+                } else {
+                  // Default to String for IDs
+                  joinTableSchemas[tableName][columnName] = "String";
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+
     const fs = require("fs");
     const path = require("path");
 
     try {
       // Read the Python stream processor file
       const pythonFilePath = path.join(__dirname, "python-stream-processor.py");
-      return fs.readFileSync(pythonFilePath, "utf8");
+      let pythonCode = fs.readFileSync(pythonFilePath, "utf8");
+
+      // Inject schema mapping into Python code
+      pythonCode = pythonCode.replace(
+        /# SCHEMA_MAPPING_PLACEHOLDER/,
+        `# Schema mapping from GraphQL types
+SCHEMA_MAPPING = ${JSON.stringify(schemaMapping, null, 2)}
+JOIN_TABLE_SCHEMAS = ${JSON.stringify(joinTableSchemas, null, 2)}`
+      );
+
+      return pythonCode;
     } catch (error) {
       // Fallback inline Python code based on the JavaScript version
       return `
@@ -583,17 +665,17 @@ logger.setLevel(logging.INFO)
 
 # Initialize AWS clients
 s3_client = boto3.client('s3')
-glue_client = boto3.client('glue')
 sqs_client = boto3.client('sqs')
 
 BUCKET_NAME = os.environ['S3_BUCKET_NAME']
-
-# Cache for Glue table schema checks to prevent excessive API calls
-# Key: table_name, Value: (last_check_timestamp, known_columns_set, table_exists)
-_glue_table_cache = {}
-CACHE_TTL_SECONDS = 300  # Cache for 5 minutes to avoid excessive Glue/S3 API calls
-GLUE_DATABASE = os.environ['ATHENA_DATABASE_NAME']
 CASCADE_DELETION_QUEUE_URL = os.environ.get('CASCADE_DELETION_QUEUE_URL')
+
+# Schema mapping from GraphQL types
+SCHEMA_MAPPING = ${JSON.stringify(schemaMapping, null, 2)}
+JOIN_TABLE_SCHEMAS = ${JSON.stringify(joinTableSchemas, null, 2)}
+
+# Glue tables are now created during CDK deployment - no Glue client needed here
+# This eliminates expensive S3 ListBucket operations
 
 def lambda_handler(event, context):
     """Main Lambda handler for DynamoDB stream processing"""
@@ -742,11 +824,11 @@ def handle_join_table_data_item(item, year, month, day, event_name):
     logger.info(f"Processing join table data item for '{join_table}' with relationId '{relation_id}' - {event_name}")
     
     # Convert to DataFrame and write as Parquet
-    df = create_dataframe_from_item(item)
+    df = create_dataframe_from_item(item, join_table_name=join_table)
     write_parquet_to_s3(df, s3_key)
     
-    # Ensure Glue table exists with Parquet format
-    ensure_optimized_glue_table(athena_table_name, table_location, item, df)
+    # Glue tables are now created during CDK deployment, no need to check/create here
+    # This eliminates expensive S3 ListBucket operations
     
     # Delete the temporary joinTableData item after processing
     # This must happen synchronously to ensure cleanup
@@ -788,11 +870,11 @@ def handle_legacy_join_table_item(item, year, month, day, event_name):
     logger.info(f"Processing legacy join table item for '{join_table}' - {event_name}")
     
     # Convert to DataFrame and write as Parquet
-    df = create_dataframe_from_item(item)
+    df = create_dataframe_from_item(item, join_table_name=join_table)
     write_parquet_to_s3(df, s3_key)
     
-    # Ensure Glue table exists with Parquet format
-    ensure_optimized_glue_table(athena_table_name, table_location, item, df)
+    # Glue tables are now created during CDK deployment, no need to check/create here
+    # This eliminates expensive S3 ListBucket operations
 
 def handle_regular_entity_item(item, entity_type, year, month, day, event_name):
     """Handle regular entity items with date partitioning"""
@@ -803,24 +885,36 @@ def handle_regular_entity_item(item, entity_type, year, month, day, event_name):
     logger.info(f"Processing regular entity item for '{entity_type}' - {event_name}")
     
     # Convert to DataFrame and write as Parquet
-    df = create_dataframe_from_item(item)
+    df = create_dataframe_from_item(item, entity_type=entity_type)
     write_parquet_to_s3(df, s3_key)
     
-    # Ensure Glue table exists with Parquet format
-    ensure_optimized_glue_table(athena_table_name, table_location, item, df)
+    # Glue tables are now created during CDK deployment, no need to check/create here
+    # This eliminates expensive S3 ListBucket operations
 
-def create_dataframe_from_item(item):
-    """Convert DynamoDB item to pandas DataFrame with proper timestamp handling"""
+def create_dataframe_from_item(item, entity_type=None, join_table_name=None):
+    """Convert DynamoDB item to pandas DataFrame with proper type handling based on GraphQL schema"""
     # Create DataFrame with single row, minimal metadata
     df = pd.DataFrame([item])
     
-    # Optimize data types with proper timestamp handling
+    # Determine which schema to use
+    schema = None
+    if join_table_name:
+        schema = JOIN_TABLE_SCHEMAS.get(join_table_name.lower(), {})
+    elif entity_type:
+        schema = SCHEMA_MAPPING.get(entity_type.lower(), {})
+    
+    # Optimize data types based on GraphQL schema types
     for column in df.columns:
         if column.startswith('_partition_'):
             continue
-            
-        # Only handle timestamp fields if they are actual ISO 8601 timestamps (AWSDateTime)
-        if (isinstance(df[column].iloc[0], str) and is_iso_timestamp(df[column].iloc[0])):
+        
+        # Get expected type from schema
+        expected_type = None
+        if schema and column in schema:
+            expected_type = schema[column]
+        
+        # Handle timestamp fields (AWSDateTime)
+        if expected_type == 'AWSDateTime' or (expected_type is None and isinstance(df[column].iloc[0], str) and is_iso_timestamp(df[column].iloc[0])):
             try:
                 # Convert ISO 8601 timestamp to pandas datetime with UTC timezone
                 df[column] = pd.to_datetime(df[column], format='mixed', utc=True)
@@ -830,32 +924,54 @@ def create_dataframe_from_item(item):
                 # Keep as string if conversion fails
                 df[column] = df[column].astype('string')
         
-        # Optimize numeric types without pandas overhead
-        elif df[column].dtype == 'object':
-            # Try to convert to most efficient numeric type
+        # Handle String/ID types - must stay as string even if numeric-looking
+        elif expected_type in ['String', 'ID']:
+            df[column] = df[column].astype('string')
+            logger.debug(f"Enforcing String type for '{column}' (value: {df[column].iloc[0]})")
+        
+        # Handle Int types
+        elif expected_type == 'Int':
             try:
-                numeric_series = pd.to_numeric(df[column], errors='ignore')
-                if not numeric_series.equals(df[column]):
-                    # Check if it's integer
-                    if numeric_series.dtype == 'int64':
-                        df[column] = numeric_series.astype('int32')  # Use smaller int type
-                    elif numeric_series.dtype == 'float64':
-                        df[column] = numeric_series.astype('float32')  # Use smaller float type
-                    else:
-                        df[column] = numeric_series
-                else:
-                    # Keep as minimal string type
-                    df[column] = df[column].astype('string')
-            except:
+                numeric_series = pd.to_numeric(df[column], errors='coerce', downcast='integer')
+                df[column] = numeric_series.astype('int32')
+                logger.debug(f"Converted Int field '{column}' to int32")
+            except Exception as e:
+                logger.warning(f"Failed to convert Int field '{column}': {e}")
                 df[column] = df[column].astype('string')
         
-        # Convert other types to minimal representations
-        elif df[column].dtype == 'bool':
-            df[column] = df[column].astype('bool')  # Already minimal
-        elif df[column].dtype == 'int64':
-            df[column] = df[column].astype('int32')  # Use smaller int
-        elif df[column].dtype == 'float64':
-            df[column] = df[column].astype('float32')  # Use smaller float
+        # Handle Float types
+        elif expected_type == 'Float':
+            try:
+                numeric_series = pd.to_numeric(df[column], errors='coerce', downcast='float')
+                df[column] = numeric_series.astype('float32')
+                logger.debug(f"Converted Float field '{column}' to float32")
+            except Exception as e:
+                logger.warning(f"Failed to convert Float field '{column}': {e}")
+                df[column] = df[column].astype('string')
+        
+        # Handle Boolean types
+        elif expected_type == 'Boolean':
+            df[column] = df[column].astype('bool')
+            logger.debug(f"Converted Boolean field '{column}' to bool")
+        
+        # If no schema type found, infer from data (fallback for backwards compatibility)
+        elif expected_type is None:
+            if df[column].dtype == 'object':
+                # Check if it's a timestamp string
+                if isinstance(df[column].iloc[0], str) and is_iso_timestamp(df[column].iloc[0]):
+                    try:
+                        df[column] = pd.to_datetime(df[column], format='mixed', utc=True)
+                    except:
+                        df[column] = df[column].astype('string')
+                else:
+                    # Keep as string if no schema type is defined
+                    df[column] = df[column].astype('string')
+            elif df[column].dtype == 'bool':
+                df[column] = df[column].astype('bool')
+            elif df[column].dtype == 'int64':
+                df[column] = df[column].astype('int32')
+            elif df[column].dtype == 'float64':
+                df[column] = df[column].astype('float32')
     
     return df
 
@@ -939,239 +1055,10 @@ def write_parquet_to_s3(df, s3_key):
         logger.error(f"Error writing Parquet to S3: {str(e)}")
         raise
 
-def ensure_optimized_glue_table(table_name, location, sample_item, df):
-    """Create or update Glue table with Parquet format support"""
-    try:
-        # Check cache first to avoid excessive Glue API calls
-        current_time = datetime.utcnow().timestamp()
-        cache_key = table_name
-        cached_entry = _glue_table_cache.get(cache_key)
-        
-        # Get current DataFrame columns (excluding partition and internal fields)
-        df_column_names_lower = set()
-        for column_name in df.columns:
-            if column_name.startswith('_partition_') or column_name in ['PK', 'SK', 'GSI1-PK', 'GSI1-SK', 'entityType', 'entityId']:
-                continue
-            df_column_names_lower.add(column_name.lower())
-        
-        # Check if we have a recent cache entry and if all DataFrame columns are already known
-        if cached_entry:
-            last_check_time, known_columns_lower, table_exists = cached_entry
-            time_since_check = current_time - last_check_time
-            
-            # If cache is still valid and all DataFrame columns are already known, skip Glue API call
-            if time_since_check < CACHE_TTL_SECONDS and df_column_names_lower.issubset(known_columns_lower) and table_exists:
-                logger.debug(f"Using cached schema for table '{table_name}', skipping Glue API call")
-                return
-        
-        # Check if table exists (this is a lightweight Glue API call, not S3)
-        existing_table = glue_client.get_table(DatabaseName=GLUE_DATABASE, Name=table_name)
-        logger.info(f"Table '{table_name}' already exists, checking for new columns")
-        
-        # Get existing columns from Glue table and deduplicate (keep first occurrence)
-        # Use case-insensitive comparison to detect duplicates
-        existing_columns_list = existing_table['Table']['StorageDescriptor']['Columns']
-        seen_column_names = set()
-        seen_column_names_lower = set()  # For case-insensitive duplicate detection
-        deduplicated_existing_columns = []
-        for col in existing_columns_list:
-            col_name = col['Name']
-            col_name_lower = col_name.lower()
-            if col_name_lower not in seen_column_names_lower:
-                seen_column_names_lower.add(col_name_lower)
-                seen_column_names.add(col_name)
-                deduplicated_existing_columns.append(col)
-            else:
-                logger.warning(f"Found duplicate column '{col_name}' (case-insensitive match) in existing table '{table_name}', removing duplicate")
-        
-        # Create a lookup dictionary for quick case-insensitive checks
-        # Key: lowercase name, Value: original column definition
-        existing_columns_lower = {col['Name'].lower(): col for col in deduplicated_existing_columns}
-        existing_columns = {col['Name']: col for col in deduplicated_existing_columns}
-        
-        # Get columns from DataFrame (excluding partition columns and internal fields)
-        # Deduplicate DataFrame columns first (in case DataFrame has duplicates)
-        # Use case-insensitive comparison to catch duplicates with different casing
-        seen_df_columns = set()
-        seen_df_columns_lower = set()  # For case-insensitive duplicate detection
-        df_columns = {}
-        for column_name in df.columns:
-            if column_name.startswith('_partition_') or column_name in ['PK', 'SK', 'GSI1-PK', 'GSI1-SK', 'entityType', 'entityId']:
-                continue
-            
-            column_name_lower = column_name.lower()
-            # Skip if we've already seen this column name in DataFrame (case-insensitive)
-            if column_name_lower in seen_df_columns_lower:
-                logger.warning(f"Duplicate column '{column_name}' (case-insensitive match) found in DataFrame for table '{table_name}', skipping duplicate")
-                continue
-            
-            seen_df_columns_lower.add(column_name_lower)
-            seen_df_columns.add(column_name)
-            column_type = infer_glue_type_from_dataframe(df, column_name)
-            df_columns[column_name] = {
-                'Name': column_name,
-                'Type': column_type
-            }
-        
-        # Find new columns that don't exist in Glue table (case-insensitive check)
-        new_columns = []
-        for col_name, col_def in df_columns.items():
-            col_name_lower = col_name.lower()
-            if col_name_lower not in existing_columns_lower:
-                new_columns.append(col_def)
-                logger.info(f"Found new column '{col_name}' (type: {col_def['Type']}) to add to table '{table_name}'")
-            else:
-                # Column exists (case-insensitive match) - check if casing is different
-                existing_col = existing_columns_lower[col_name_lower]
-                if existing_col['Name'] != col_name:
-                    logger.info(f"Column '{col_name}' already exists as '{existing_col['Name']}' in table '{table_name}' (case-insensitive match), skipping")
-        
-        # Update table if new columns are found or if duplicates were removed
-        if new_columns or len(deduplicated_existing_columns) != len(existing_columns_list):
-            # Get existing table definition
-            table_input = existing_table['Table']
-            
-            # Combine deduplicated existing columns + new columns, then deduplicate again to be absolutely safe
-            # Use case-insensitive comparison for final deduplication
-            combined_columns = deduplicated_existing_columns + new_columns
-            final_seen = set()
-            final_seen_lower = set()  # For case-insensitive duplicate detection
-            updated_columns = []
-            for col in combined_columns:
-                col_name = col['Name']
-                col_name_lower = col_name.lower()
-                if col_name_lower not in final_seen_lower:
-                    final_seen_lower.add(col_name_lower)
-                    final_seen.add(col_name)
-                    updated_columns.append(col)
-                else:
-                    logger.warning(f"Duplicate column '{col_name}' (case-insensitive match) detected in final column list for table '{table_name}', removing duplicate")
-            
-            # Update the table with new columns
-            glue_client.update_table(
-                DatabaseName=GLUE_DATABASE,
-                TableInput={
-                    'Name': table_name,
-                    'Description': table_input.get('Description', ''),
-                    'PartitionKeys': table_input.get('PartitionKeys', []),
-                    'StorageDescriptor': {
-                        'Columns': updated_columns,
-                        'Location': table_input['StorageDescriptor']['Location'],
-                        'InputFormat': table_input['StorageDescriptor']['InputFormat'],
-                        'OutputFormat': table_input['StorageDescriptor']['OutputFormat'],
-                        'SerdeInfo': table_input['StorageDescriptor']['SerdeInfo'],
-                        'Parameters': table_input['StorageDescriptor'].get('Parameters', {})
-                    },
-                    'TableType': table_input.get('TableType', 'EXTERNAL_TABLE'),
-                    'Parameters': table_input.get('Parameters', {})
-                }
-            )
-            if new_columns:
-                logger.info(f"Successfully updated table '{table_name}' with {len(new_columns)} new columns: {[col['Name'] for col in new_columns]}")
-            if len(deduplicated_existing_columns) != len(existing_columns_list):
-                logger.info(f"Successfully removed {len(existing_columns_list) - len(deduplicated_existing_columns)} duplicate columns from table '{table_name}'")
-            
-            # Update cache with new columns after successful update
-            updated_columns_lower = {col['Name'].lower() for col in updated_columns}
-            _glue_table_cache[cache_key] = (current_time, updated_columns_lower, True)
-        else:
-            logger.info(f"Table '{table_name}' schema is up to date, no new columns to add")
-            # Update cache even when no changes are needed
-            existing_columns_lower_set = {col['Name'].lower() for col in deduplicated_existing_columns}
-            _glue_table_cache[cache_key] = (current_time, existing_columns_lower_set, True)
-        
-        return
-    except glue_client.exceptions.EntityNotFoundException:
-        logger.info(f"Creating new Parquet table: {table_name}")
-        create_parquet_glue_table(table_name, location, sample_item, df)
-        # Update cache after creating new table
-        df_column_names_lower_set = {col.lower() for col in df.columns if not col.startswith('_partition_') and col not in ['PK', 'SK', 'GSI1-PK', 'GSI1-SK', 'entityType', 'entityId']}
-        _glue_table_cache[cache_key] = (current_time, df_column_names_lower_set, True)
-    except Exception as e:
-        # Log error but don't fail - table might be created concurrently
-        logger.warning(f"Error checking/creating Glue table '{table_name}': {e}")
-        # Don't raise - allow processing to continue
-
-def create_parquet_glue_table(table_name, location, sample_item, df):
-    """Create optimized Parquet Glue table using processed DataFrame types"""
-    # Generate columns from DataFrame dtypes (more accurate than sample item)
-    # Deduplicate columns to prevent any duplicates (case-insensitive)
-    seen_column_names = set()
-    seen_column_names_lower = set()  # For case-insensitive duplicate detection
-    columns = []
-    for column_name in df.columns:
-        if column_name.startswith('_partition_') or column_name in ['PK', 'SK', 'GSI1-PK', 'GSI1-SK', 'entityType', 'entityId']:
-            continue
-        
-        column_name_lower = column_name.lower()
-        # Skip if we've already seen this column name (case-insensitive deduplicate)
-        if column_name_lower in seen_column_names_lower:
-            logger.warning(f"Duplicate column '{column_name}' (case-insensitive match) found in DataFrame for table '{table_name}', skipping duplicate")
-            continue
-        
-        seen_column_names_lower.add(column_name_lower)
-        seen_column_names.add(column_name)
-        column_type = infer_glue_type_from_dataframe(df, column_name)
-        columns.append({
-            'Name': column_name,
-            'Type': column_type
-        })
-        logger.info(f"Creating Parquet column: {column_name} -> {column_type}")
-    
-    # Add partition columns
-    partition_keys = [
-        {'Name': 'year', 'Type': 'string'},
-        {'Name': 'month', 'Type': 'string'},
-        {'Name': 'day', 'Type': 'string'}
-    ]
-    
-    # Build storage template using string operations to avoid template literal conflicts
-    template_path = location + 'year={year}/month={month}/day={day}/'
-    storage_template = template_path.replace('{year}', '$' + '{year}').replace('{month}', '$' + '{month}').replace('{day}', '$' + '{day}')
-    
-    logger.info(f"Creating optimized Parquet table '{table_name}' with {len(columns)} columns")
-    
-    # Create Parquet table
-    glue_client.create_table(
-        DatabaseName=GLUE_DATABASE,
-        TableInput={
-            'Name': table_name,
-            'Description': f'Optimized Parquet table for {table_name} with SNAPPY compression',
-            'PartitionKeys': partition_keys,
-            'StorageDescriptor': {
-                'Columns': columns,
-                'Location': location,
-                'InputFormat': 'org.apache.hadoop.hive.ql.io.parquet.MapredParquetInputFormat',
-                'OutputFormat': 'org.apache.hadoop.hive.ql.io.parquet.MapredParquetOutputFormat',
-                'SerdeInfo': {
-                    'SerializationLibrary': 'org.apache.hadoop.hive.ql.io.parquet.serde.ParquetHiveSerDe'
-                },
-                'Parameters': {
-                    'parquet.compression': 'SNAPPY',
-                    'classification': 'parquet'
-                }
-            },
-            'TableType': 'EXTERNAL_TABLE',
-            'Parameters': {
-                'EXTERNAL': 'TRUE',
-                'parquet.compression': 'SNAPPY',
-                'projection.enabled': 'true',
-                'projection.year.type': 'integer',
-                'projection.year.range': '2024,2030',
-                'projection.month.type': 'integer',
-                'projection.month.range': '1,12',
-                'projection.month.digits': '2',
-                'projection.day.type': 'integer',
-                'projection.day.range': '1,31',
-                'projection.day.digits': '2',
-                'storage.location.template': storage_template,
-                'has_encrypted_data': 'false',
-                'typeOfData': 'file'
-            }
-        }
-    )
-    
-    logger.info(f"Successfully created Parquet table '{table_name}' with partition projection")
+# Glue tables are now created during CDK deployment based on GraphQL schema
+# This eliminates expensive S3 ListBucket operations that were triggered by
+# glue_client.get_table() calls in the stream processor
+# The stream processor now only writes Parquet files - no Glue API calls needed
 
 def infer_glue_type_from_dataframe(df, column_name):
     """Infer Glue data type from DataFrame column dtype"""

@@ -16,6 +16,8 @@ import * as glue from "aws-cdk-lib/aws-glue";
 import * as events from "aws-cdk-lib/aws-events";
 import * as targets from "aws-cdk-lib/aws-events-targets";
 import * as sqs from "aws-cdk-lib/aws-sqs";
+import { Provider } from "aws-cdk-lib/custom-resources";
+import { CustomResource } from "aws-cdk-lib";
 import {
   DynamoEventSource,
   SqsEventSource,
@@ -31,6 +33,31 @@ import * as crypto from "crypto";
 function generateShortHash(input: string): string {
   const hash = crypto.createHash("sha256").update(input).digest("hex");
   return hash.substring(0, 16);
+}
+
+/**
+ * Map GraphQL field type to Glue column type
+ */
+function mapGraphQLTypeToGlueType(graphQLType: string): string {
+  // Remove list and non-null markers
+  const baseType = graphQLType.replace(/[\[\]!]/g, "").trim();
+
+  switch (baseType) {
+    case "String":
+    case "ID":
+      return "string";
+    case "Int":
+      return "bigint";
+    case "Float":
+      return "double";
+    case "Boolean":
+      return "boolean";
+    case "AWSDateTime":
+      return "timestamp";
+    default:
+      // For custom types, default to string
+      return "string";
+  }
 }
 
 export interface OcGraphQLStackProps extends StackProps {
@@ -254,11 +281,19 @@ export class OcGraphQLStack extends Stack {
     // Create AppSync resolvers
     this.createAppSyncResolvers(api, lambdaFunctions, schemaMetadata);
 
+    // Create Glue tables for all entity types and join tables (after lambdaRole is created)
+    this.createGlueTables(
+      glueDatabase,
+      dataBucket,
+      schemaMetadata,
+      projectName,
+      lambdaRole
+    );
+
     // DynamoDB Stream processor (Python with Parquet support)
-    const streamProcessorFunctionName = `${projectName}-stream-processor`;
-    const streamProcessorHash = generateShortHash(streamProcessorFunctionName);
+    // No hash needed - created once per project, won't hit 64 char limit
     const streamProcessor = new lambda.Function(this, "StreamProcessor", {
-      functionName: `OCG-${projectName}-${streamProcessorHash}`,
+      functionName: `OCG-${projectName}-stream-processor`,
       runtime: lambda.Runtime.PYTHON_3_11,
       handler: `ocg-${projectName}-stream-processor.lambda_handler`,
       code: lambda.Code.fromAsset(generatedCodePath),
@@ -288,15 +323,12 @@ export class OcGraphQLStack extends Stack {
     cascadeDeletionQueue.grantSendMessages(streamProcessor);
 
     // Cascade deletion queue listener Lambda (always created)
-    const cascadeDeletionListenerFunctionName = `${projectName}-cascade-deletion-listener`;
-    const cascadeDeletionListenerHash = generateShortHash(
-      cascadeDeletionListenerFunctionName
-    );
+    // No hash needed - created once per project, won't hit 64 char limit
     const cascadeDeletionListener = new lambda.Function(
       this,
       "CascadeDeletionListener",
       {
-        functionName: `OCG-${projectName}-${cascadeDeletionListenerHash}`,
+        functionName: `OCG-${projectName}-cascade-deletion-listener`,
         runtime: lambda.Runtime.NODEJS_18_X,
         handler: `ocg-${projectName}-cascade-deletion-listener.handler`,
         code: lambda.Code.fromAsset(generatedCodePath),
@@ -320,13 +352,10 @@ export class OcGraphQLStack extends Stack {
     dataBucket.grantDelete(cascadeDeletionListener);
 
     // Deletion listener Lambda (for DELETE SQL operations)
+    // No hash needed - created once per project, won't hit 64 char limit
     if (hasDeleteMutations && deletionQueue) {
-      const deletionListenerFunctionName = `${projectName}-deletion-listener`;
-      const deletionListenerHash = generateShortHash(
-        deletionListenerFunctionName
-      );
       const deletionListener = new lambda.Function(this, "DeletionListener", {
-        functionName: `OCG-${projectName}-${deletionListenerHash}`,
+        functionName: `OCG-${projectName}-deletion-listener`,
         runtime: lambda.Runtime.NODEJS_18_X,
         handler: `ocg-${projectName}-deletion-listener.handler`,
         code: lambda.Code.fromAsset(generatedCodePath),
@@ -568,12 +597,12 @@ export class OcGraphQLStack extends Stack {
       schemaMetadata.queries.some((q) => q.isTask) || hasDeleteMutations;
     if (hasTasks) {
       const functionName = `${projectName}-athena-execution-tracker`;
-      const hash = generateShortHash(functionName);
+      // No hash needed - created once per project, won't hit 64 char limit
       functions[functionName] = new lambda.Function(
         this,
         "AthenaExecutionTrackerFunction",
         {
-          functionName: `OCG-${projectName}-${hash}`,
+          functionName: `OCG-${projectName}-athena-execution-tracker`,
           runtime: lambda.Runtime.NODEJS_18_X,
           handler: `ocg-${functionName}.handler`,
           code: lambda.Code.fromAsset(generatedCodePath),
@@ -760,5 +789,345 @@ export class OcGraphQLStack extends Stack {
 
     // Removed: Field-level @sql_query resolvers and @resolver type resolvers
     // @resolver directive and @sql_query on type fields are no longer supported
+  }
+
+  /**
+   * Create Glue tables for all entity types and join tables
+   * This eliminates the need for stream processor to check/create tables,
+   * which was causing excessive S3 ListBucket operations
+   */
+  private createGlueTables(
+    glueDatabase: glue.CfnDatabase,
+    dataBucket: s3.Bucket,
+    schemaMetadata: SchemaMetadata,
+    projectName: string,
+    lambdaRole: iam.Role
+  ): void {
+    const databaseName = `${projectName}_db`;
+    const bucketName = dataBucket.bucketName;
+    const baseLocation = `s3://${bucketName}/tables/`;
+
+    // Create tables for all entity types (excluding task_response types)
+    for (const type of schemaMetadata.types) {
+      // Skip task_response types and primitive types
+      if (type.isTaskResponse || type.isPrimitive) {
+        continue;
+      }
+
+      const tableName = type.name.toLowerCase();
+      const location = `${baseLocation}${tableName}/`;
+
+      // Extract columns from GraphQL type fields
+      const columns: glue.CfnTable.ColumnProperty[] = [];
+      for (const field of type.fields) {
+        // Skip internal fields
+        if (
+          field.name === "PK" ||
+          field.name === "SK" ||
+          field.name === "GSI1-PK" ||
+          field.name === "GSI1-SK" ||
+          field.name === "entityType" ||
+          field.name === "entityId" ||
+          field.name.startsWith("_partition_")
+        ) {
+          continue;
+        }
+
+        const glueType = mapGraphQLTypeToGlueType(field.type);
+        columns.push({
+          name: field.name,
+          type: glueType,
+        });
+      }
+
+      // Add standard timestamp fields if not already present
+      const hasCreatedAt = columns.some((c) => c.name === "createdAt");
+      const hasUpdatedAt = columns.some((c) => c.name === "updatedAt");
+
+      if (!hasCreatedAt) {
+        columns.push({ name: "createdAt", type: "timestamp" });
+      }
+      if (!hasUpdatedAt) {
+        columns.push({ name: "updatedAt", type: "timestamp" });
+      }
+
+      // Create Glue table with partition projection
+      // Storage template uses ${year} syntax for partition projection (not TypeScript template literal)
+      const storageTemplate = `${location}year=\${year}/month=\${month}/day=\${day}/`;
+
+      this.createGlueTableCustomResource(
+        `GlueTable${type.name}`,
+        databaseName,
+        tableName,
+        columns,
+        location,
+        storageTemplate,
+        `Parquet table for ${type.name} entity with SNAPPY compression`,
+        lambdaRole
+      );
+    }
+
+    // Create tables for join tables
+    for (const joinTable of schemaMetadata.joinTables) {
+      const tableName = joinTable.toLowerCase();
+      const location = `${baseLocation}${tableName}/`;
+
+      // Extract columns from INSERT statements that use this join table
+      const columns: glue.CfnTable.ColumnProperty[] = [];
+
+      // Find mutations that use this join table
+      for (const mutation of schemaMetadata.mutations) {
+        if (mutation.sqlQuery?.query) {
+          const query = mutation.sqlQuery.query;
+
+          // Check if this mutation uses the current join table
+          const joinTableMatch = query.match(/\$join_table\(([^)]+)\)/);
+          if (
+            joinTableMatch &&
+            joinTableMatch[1].toLowerCase() === joinTable.toLowerCase()
+          ) {
+            // Extract column definitions from INSERT statement
+            // Pattern: INSERT INTO $join_table(table) (col1:Type1, col2:Type2) VALUES ...
+            const insertMatch = query.match(
+              /INSERT\s+INTO\s+\$join_table\([^)]+\)\s*\(([^)]+)\)/i
+            );
+            if (insertMatch) {
+              const columnDefs = insertMatch[1]
+                .split(",")
+                .map((col) => col.trim());
+
+              // Parse each column definition (e.g., "userId:User" -> columnName: "userId")
+              for (const colDef of columnDefs) {
+                const parts = colDef.split(":");
+                if (parts.length === 2) {
+                  const columnName = parts[0].trim();
+
+                  // Find the column type from mutation arguments
+                  const arg = mutation.arguments?.find(
+                    (a) => a.name === columnName
+                  );
+                  if (arg) {
+                    const glueType = mapGraphQLTypeToGlueType(arg.type);
+
+                    // Only add if not already added (avoid duplicates)
+                    if (!columns.some((c) => c.name === columnName)) {
+                      columns.push({
+                        name: columnName,
+                        type: glueType,
+                      });
+                    }
+                  } else {
+                    // If argument not found, default to string (ID types)
+                    if (!columns.some((c) => c.name === columnName)) {
+                      columns.push({
+                        name: columnName,
+                        type: "string",
+                      });
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+
+      // Add standard join table columns
+      if (!columns.some((c) => c.name === "relationId")) {
+        columns.unshift({ name: "relationId", type: "string" });
+      }
+      if (!columns.some((c) => c.name === "s3Key")) {
+        columns.push({ name: "s3Key", type: "string" });
+      }
+      if (!columns.some((c) => c.name === "createdAt")) {
+        columns.push({ name: "createdAt", type: "timestamp" });
+      }
+
+      // Storage template uses ${year} syntax for partition projection (not TypeScript template literal)
+      const storageTemplate = `${location}year=\${year}/month=\${month}/day=\${day}/`;
+
+      this.createGlueTableCustomResource(
+        `GlueTableJoin${joinTable}`,
+        databaseName,
+        tableName,
+        columns,
+        location,
+        storageTemplate,
+        `Parquet table for join table ${joinTable} with SNAPPY compression`,
+        lambdaRole
+      );
+    }
+  }
+
+  /**
+   * Create a Glue table using Custom Resource Lambda
+   * This handles existing tables gracefully (creates if not exists, updates if exists)
+   */
+  private createGlueTableCustomResource(
+    id: string,
+    databaseName: string,
+    tableName: string,
+    columns: glue.CfnTable.ColumnProperty[],
+    location: string,
+    storageTemplate: string,
+    description: string,
+    lambdaRole: iam.Role
+  ): void {
+    // Create Custom Resource Lambda that handles Glue table create/update
+    const glueTableHandler = new lambda.Function(this, `${id}Handler`, {
+      functionName: `OCG-${this.projectName}-glue-table-handler-${generateShortHash(id)}`,
+      runtime: lambda.Runtime.NODEJS_18_X,
+      handler: "index.handler",
+      code: lambda.Code.fromInline(`
+const { GlueClient, GetTableCommand, CreateTableCommand, UpdateTableCommand } = require('@aws-sdk/client-glue');
+
+const glue = new GlueClient({ region: process.env.AWS_REGION });
+
+exports.handler = async (event) => {
+  const { RequestType, ResourceProperties } = event;
+  console.log('Event:', JSON.stringify(event, null, 2));
+  const { DatabaseName, TableName, TableInput: TableInputJson } = ResourceProperties;
+  console.log('Parsing TableInput from:', TableInputJson);
+  const TableInput = JSON.parse(TableInputJson);
+  console.log('Parsed TableInput:', JSON.stringify(TableInput, null, 2));
+  
+  try {
+    if (RequestType === 'Delete') {
+      // Don't delete tables on stack deletion (they may contain data)
+      return { PhysicalResourceId: TableName };
+    }
+    
+    // Try to get existing table
+    let tableExists = false;
+    try {
+      await glue.send(new GetTableCommand({ DatabaseName, Name: TableName }));
+      tableExists = true;
+    } catch (error) {
+      if (error.name !== 'EntityNotFoundException') {
+        throw error;
+      }
+    }
+    
+    // Ensure Name is set in TableInput
+    const finalTableInput = {
+      ...TableInput,
+      Name: TableName
+    };
+    
+    // Log the TableInput for debugging
+    console.log('TableInput structure:', JSON.stringify(finalTableInput, null, 2));
+    
+    if (tableExists) {
+      // Update existing table - UpdateTableCommand requires all properties
+      console.log(\`Updating existing Glue table: \${TableName}\`);
+      await glue.send(new UpdateTableCommand({
+        DatabaseName,
+        TableInput: finalTableInput
+      }));
+      console.log(\`Successfully updated Glue table: \${TableName}\`);
+    } else {
+      // Create new table
+      console.log(\`Creating new Glue table: \${TableName}\`);
+      await glue.send(new CreateTableCommand({
+        DatabaseName,
+        TableInput: finalTableInput
+      }));
+      console.log(\`Successfully created Glue table: \${TableName}\`);
+    }
+    
+    return {
+      PhysicalResourceId: TableName,
+      Data: { TableName }
+    };
+  } catch (error) {
+    console.error('Error managing Glue table:', error);
+    throw error;
+  }
+};
+      `),
+      role: lambdaRole,
+      timeout: Duration.minutes(5),
+    });
+
+    // Grant Glue permissions
+    glueTableHandler.addToRolePolicy(
+      new iam.PolicyStatement({
+        effect: iam.Effect.ALLOW,
+        actions: [
+          "glue:GetTable",
+          "glue:CreateTable",
+          "glue:UpdateTable",
+          "glue:DeleteTable",
+        ],
+        resources: [
+          `arn:aws:glue:${this.region}:${this.account}:catalog`,
+          `arn:aws:glue:${this.region}:${this.account}:database/${databaseName}`,
+          `arn:aws:glue:${this.region}:${this.account}:table/${databaseName}/${tableName}`,
+        ],
+      })
+    );
+
+    // Create table input - AWS SDK expects capitalized property names
+    // Convert columns from CDK format to AWS SDK format
+    const sdkColumns = columns.map((col) => ({
+      Name: col.name,
+      Type: col.type,
+    }));
+
+    const tableInput = {
+      Name: tableName,
+      Description: description,
+      PartitionKeys: [
+        { Name: "year", Type: "string" },
+        { Name: "month", Type: "string" },
+        { Name: "day", Type: "string" },
+      ],
+      StorageDescriptor: {
+        Columns: sdkColumns,
+        Location: location,
+        InputFormat:
+          "org.apache.hadoop.hive.ql.io.parquet.MapredParquetInputFormat",
+        OutputFormat:
+          "org.apache.hadoop.hive.ql.io.parquet.MapredParquetOutputFormat",
+        SerdeInfo: {
+          SerializationLibrary:
+            "org.apache.hadoop.hive.ql.io.parquet.serde.ParquetHiveSerDe",
+        },
+        Parameters: {
+          "parquet.compression": "SNAPPY",
+          classification: "parquet",
+        },
+      },
+      TableType: "EXTERNAL_TABLE",
+      Parameters: {
+        EXTERNAL: "TRUE",
+        "parquet.compression": "SNAPPY",
+        "projection.enabled": "true",
+        "projection.year.type": "integer",
+        "projection.year.range": "2024,2030",
+        "projection.month.type": "integer",
+        "projection.month.range": "1,12",
+        "projection.month.digits": "2",
+        "projection.day.type": "integer",
+        "projection.day.range": "1,31",
+        "projection.day.digits": "2",
+        "storage.location.template": storageTemplate,
+        has_encrypted_data: "false",
+        typeOfData: "file",
+      },
+    };
+
+    const provider = new Provider(this, `${id}Provider`, {
+      onEventHandler: glueTableHandler,
+    });
+
+    new CustomResource(this, id, {
+      serviceToken: provider.serviceToken,
+      properties: {
+        DatabaseName: databaseName,
+        TableName: tableName,
+        TableInput: JSON.stringify(tableInput),
+      },
+    });
   }
 }

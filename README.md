@@ -2,7 +2,7 @@
 
 **A serverless GraphQL framework for AWS** - Automatically generate and deploy production-ready GraphQL APIs with advanced analytics capabilities.
 
-OC-GraphQL is a framework that abstracts AWS infrastructure complexity, automatically generating and deploying complete serverless GraphQL applications. Transform your GraphQL schema into a production-ready infrastructure with real-time data analytics powered by Apache Parquet storage for 90-98% cost reduction and 50-100x faster queries, all with a single command.
+OC-GraphQL is an open-source framework that abstracts AWS infrastructure complexity, automatically generating and deploying complete serverless GraphQL applications. Transform your GraphQL schema into a production-ready infrastructure with real-time data analytics powered by Apache Parquet storage for 90-98% cost reduction and 50-100x faster queries, all with a single command.
 
 ## Key Features
 
@@ -67,7 +67,6 @@ type User {
   name: String!
   email: String!
   age: Int
-  posts: [Post!]! @sql_query(query: "SELECT * FROM post WHERE user_id = $source.id")
 }
 
 type Post {
@@ -75,19 +74,25 @@ type Post {
   title: String!
   content: String!
   userId: ID!
-  likeCount: Int! @sql_query(query: "SELECT COUNT(*) as count FROM post_likes WHERE post_id = $source.id")
+}
+
+type PostAnalytics @task_response {
+  id: ID!
+  title: String!
+  likes: Int!
 }
 
 type Query {
-  getTrendingPosts(days: Int = 7): [Post!]! @sql_query(query: """
-    SELECT p.*, COUNT(pl.id) as likes
-    FROM post p
-    LEFT JOIN post_likes pl ON p.id = pl.post_id
-    WHERE p.created_at >= current_date - interval '$args.days' day
-    GROUP BY p.id
-    ORDER BY likes DESC
-    LIMIT 10
-  """)
+  getTrendingPosts(days: Int = 7): [PostAnalytics!]!
+    @sql_query(query: """
+      SELECT p.id, p.title, COUNT(pl.id) as likes
+      FROM post p
+      LEFT JOIN post_likes pl ON p.id = pl.post_id
+      WHERE p.created_at >= current_date - interval '$args.days' day
+      GROUP BY p.id, p.title
+      ORDER BY likes DESC
+      LIMIT 10
+    """)
 }
 EOF
 
@@ -122,16 +127,17 @@ The framework automatically generates and deploys:
 
 ### Function Types Generated
 
-| **Function Type**   | **Count**                      | **Runtime**  | **Memory** | **Timeout** | **Purpose**               | **Example**                          |
-| ------------------- | ------------------------------ | ------------ | ---------- | ----------- | ------------------------- | ------------------------------------ |
-| CRUD Operations     | 4 per entity                   | Node.js 18.x | 128 MB     | 30 seconds  | Basic database operations | `OCG-api-create-user`                |
-| SQL Queries         | 1 per @sql_query               | Node.js 18.x | 256 MB     | 5 minutes   | Custom analytics          | `OCG-api-query-getTrendingPosts`     |
-| Task Mutations      | 1 per Query field              | Node.js 18.x | 256 MB     | 30 seconds  | Trigger async tasks       | `OCG-api-mutation-triggerTaskReport` |
-| Task Result Queries | 1 per Query field              | Node.js 18.x | 256 MB     | 30 seconds  | Poll task results         | `OCG-api-query-taskResultReport`     |
-| Execution Tracker   | 1 per project (if tasks exist) | Node.js 18.x | 256 MB     | 5 minutes   | Track Athena executions   | `OCG-api-athena-execution-tracker`   |
-| Stream Processor    | 1 per project                  | Python 3.11  | 1024 MB    | 5 minutes   | Real-time data pipeline   | `OCG-api-stream-processor`           |
+| **Function Type**   | **Count**                           | **Runtime**  | **Memory** | **Timeout** | **Purpose**               | **Example**                          |
+| ------------------- | ----------------------------------- | ------------ | ---------- | ----------- | ------------------------- | ------------------------------------ |
+| CRUD Operations     | 4 per entity                        | Node.js 18.x | 128 MB     | 30 seconds  | Basic database operations | `OCG-api-create-user`                |
+| Task Mutations      | 1 per Query field                   | Node.js 18.x | 256 MB     | 30 seconds  | Trigger async tasks       | `OCG-api-mutation-triggerTaskReport` |
+| Task Result Queries | 1 per Query field                   | Node.js 18.x | 256 MB     | 30 seconds  | Poll task results         | `OCG-api-query-taskResultReport`     |
+| Execution Tracker   | 1 per project (if tasks exist)      | Node.js 18.x | 256 MB     | 5 minutes   | Track Athena executions   | `OCG-api-athena-execution-tracker`   |
+| Stream Processor    | 1 per project                       | Python 3.11  | 1024 MB    | 5 minutes   | Real-time data pipeline   | `OCG-api-stream-processor`           |
+| Cascade Deletion    | 1 per project                       | Node.js 18.x | 256 MB     | 5 minutes   | Handle join table cleanup | `OCG-api-cascade-deletion-listener`  |
+| Deletion Listener   | 1 per project (if DELETE mutations) | Node.js 18.x | 256 MB     | 5 minutes   | Process DELETE operations | `OCG-api-deletion-listener`          |
 
-**Function Naming Pattern**: `OCG-{project}-{category}-{identifier}`
+**Function Naming Pattern**: `OCG-{project}-{hash}` (hash is first 16 characters of SHA256 hash)
 
 All functions are automatically configured with:
 
@@ -160,6 +166,8 @@ SELECT name FROM user WHERE year = '2024';
 
 ### `@sql_query` - Direct SQL Integration
 
+The `@sql_query` directive allows you to execute SQL queries directly within GraphQL resolvers. **Important:** This directive can only be used on `Query` and `Mutation` root type fields, not on regular type fields.
+
 ```graphql
 type Query {
   searchUsers(name: String!, city: String): [User!]!
@@ -170,25 +178,6 @@ type Query {
         AND ($args.city IS NULL OR city = $args.city)
       ORDER BY name
       """
-    )
-}
-```
-
-### `@resolver` - Custom Types
-
-```graphql
-type UserAnalytics @resolver {
-  totalPosts: Int!
-    @sql_query(
-      query: "SELECT COUNT(*) as count FROM post WHERE user_id = $source.id"
-    )
-  avgEngagement: Float!
-    @sql_query(
-      query: "SELECT AVG(like_count) FROM post WHERE user_id = $source.id"
-    )
-  topTags: [String!]!
-    @sql_query(
-      query: "SELECT tag FROM post_tags WHERE user_id = $source.id GROUP BY tag ORDER BY COUNT(*) DESC LIMIT 5"
     )
 }
 ```
@@ -234,14 +223,35 @@ type ReportData @task_response {
 - `startDate: AWSDateTime!` - When the query started
 - `finishDate: AWSDateTime` - When the query finished (null if still running)
 
-### `@return` - Computed Values
+### `@task_response` - Task Response Types
+
+Types marked with `@task_response` are used exclusively as return types for Query fields (which are automatically tasks). These types do not generate CRUD operations.
 
 ```graphql
-type SearchResult @resolver {
-  results: [User!]!
-    @sql_query(query: "SELECT * FROM user WHERE name ILIKE '%$args.query%'")
-  searchQuery: String! @return(value: "$args.query")
-  timestamp: String! @return(value: "new Date().toISOString()")
+type ReportData @task_response {
+  month: Int!
+  orders: Int!
+  revenue: Float!
+}
+```
+
+### Join Tables with `$join_table()`
+
+For many-to-many relationships, use the `$join_table()` wrapper in INSERT and DELETE operations:
+
+```graphql
+type Mutation {
+  # INSERT into join table
+  addProductToFavorite(userId: ID!, productId: ID!)
+    @sql_query(
+      query: "INSERT INTO $join_table(user_favorite_products) (userId:User, productId:Product) VALUES ($args.userId, $args.productId)"
+    )
+
+  # DELETE from join table (must use $join_table() wrapper)
+  removeProductFromFavorite(productId: ID!)
+    @sql_query(
+      query: "DELETE ufp FROM $join_table(user_favorite_products) ufp WHERE ufp.productId = $args.productId;"
+    )
 }
 ```
 
@@ -304,8 +314,16 @@ OC-GraphQL provides a complete abstraction layer over AWS services:
 
 ## 🤝 Contributing
 
-Please read [Contributing Guide](CONTRIBUTING.md) for details.
+OC-GraphQL is open source and welcomes contributions! We're excited to have you join our community.
+
+- **Report Issues**: Found a bug or have a feature request? [Open an issue](https://github.com/your-org/oc-graphql/issues)
+- **Submit PRs**: Contributions are welcome! Please read our [Contributing Guide](CONTRIBUTING.md) for details
+- **Discussions**: Join the conversation in [GitHub Discussions](https://github.com/your-org/oc-graphql/discussions)
 
 ## 📄 License
 
 MIT License - see [LICENSE](LICENSE) file for details.
+
+---
+
+**Made with ❤️ by the OC-GraphQL team**

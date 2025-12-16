@@ -18,9 +18,12 @@ OC-GraphQL automatically generates a comprehensive set of Lambda functions to ha
 
 ## 📋 Function Naming Patterns
 
-### Hash-Based Naming Convention
+### Naming Convention
 
-Lambda function names use a hash-based pattern to avoid AWS's 64-character limit. The hash is generated from the full function identifier and truncated to 16 characters.
+Lambda function names use different patterns depending on the function type:
+
+**Hash-Based Naming (for CRUD, Mutations, Task Triggers, Task Results):**
+Used to avoid AWS's 64-character limit for functions that may have long names.
 
 ```
 Pattern: OCG-{project}-{hash}
@@ -30,20 +33,31 @@ Examples:
 - OCG-blog-a1b2c3d4e5f6g7h8 (for blog-create-user)
 - OCG-blog-i9j0k1l2m3n4o5p6 (for blog-mutation-triggerTaskGenerateReport)
 - OCG-blog-q7r8s9t0u1v2w3x4 (for blog-query-taskResultGenerateReport)
-- OCG-blog-y5z6a7b8c9d0e1f2 (for blog-stream-processor)
-- OCG-blog-c3d4e5f6g7h8i9j0 (for blog-cascade-deletion-listener)
 ```
 
-**Function Identifier Patterns (used for hash generation):**
+**Descriptive Naming (for project-level functions):**
+Used for functions created once per project that won't hit the 64-character limit.
 
-- CRUD: `{project}-{operation}-{entity}` (e.g., `blog-create-user`)
-- Mutations: `{project}-mutation-{mutationName}` (e.g., `blog-mutation-likePost`)
-- Task Triggers: `{project}-mutation-triggerTask{QueryName}` (e.g., `blog-mutation-triggerTaskGetUsersByCity`)
-- Task Results: `{project}-query-taskResult{QueryName}` (e.g., `blog-query-taskResultGetUsersByCity`)
-- Stream Processor: `{project}-stream-processor`
-- Cascade Deletion Listener: `{project}-cascade-deletion-listener`
-- Deletion Listener: `{project}-deletion-listener`
-- Athena Execution Tracker: `{project}-athena-execution-tracker`
+```
+Pattern: OCG-{project}-{function-name}
+
+Examples:
+- OCG-blog-stream-processor
+- OCG-blog-cascade-deletion-listener
+- OCG-blog-deletion-listener
+- OCG-blog-athena-execution-tracker
+```
+
+**Function Identifier Patterns:**
+
+- CRUD: `{project}-{operation}-{entity}` (e.g., `blog-create-user`) → Hash-based
+- Mutations: `{project}-mutation-{mutationName}` (e.g., `blog-mutation-likePost`) → Hash-based
+- Task Triggers: `{project}-mutation-triggerTask{QueryName}` (e.g., `blog-mutation-triggerTaskGetUsersByCity`) → Hash-based
+- Task Results: `{project}-query-taskResult{QueryName}` (e.g., `blog-query-taskResultGetUsersByCity`) → Hash-based
+- Stream Processor: `OCG-{project}-stream-processor` → Descriptive (no hash)
+- Cascade Deletion Listener: `OCG-{project}-cascade-deletion-listener` → Descriptive (no hash)
+- Deletion Listener: `OCG-{project}-deletion-listener` → Descriptive (no hash)
+- Athena Execution Tracker: `OCG-{project}-athena-execution-tracker` → Descriptive (no hash)
 
 ## 🔧 Function Types & Implementation
 
@@ -497,8 +511,8 @@ exports.handler = async (event) => {
 EventBridge Lambda that automatically tracks Athena query execution state changes and updates task status.
 
 ```javascript
-// Pattern: OCG-{project}-{hash} (hash from: {project}-athena-execution-tracker)
-// Example: OCG-blog-i9j0k1l2m3n4o5p6
+// Pattern: OCG-{project}-athena-execution-tracker (no hash - created once per project)
+// Example: OCG-blog-athena-execution-tracker
 
 const {
   DynamoDBClient,
@@ -631,8 +645,8 @@ exports.handler = async (event) => {
 Real-time DynamoDB to Parquet conversion with advanced optimization, join table support, and automatic Glue table management.
 
 ```python
-# Pattern: OCG-{project}-{hash} (hash from: {project}-stream-processor)
-# Example: OCG-blog-k7l8m9n0o1p2q3r4
+# Pattern: OCG-{project}-stream-processor (no hash - created once per project)
+# Example: OCG-blog-stream-processor
 
 import json
 import os
@@ -1078,8 +1092,8 @@ SQS queue listener that automatically cleans up join table relations and S3 file
 Processes deletion tasks for DELETE SQL operations. Retrieves query results from Athena and deletes S3 Parquet files.
 
 ```javascript
-// Pattern: OCG-{project}-{hash} (hash from: {project}-cascade-deletion-listener)
-// Example: OCG-blog-m5n6o7p8q9r0s1t2
+// Pattern: OCG-{project}-cascade-deletion-listener (no hash - created once per project)
+// Example: OCG-blog-cascade-deletion-listener
 
 const {
   DynamoDBClient,
@@ -1158,8 +1172,8 @@ exports.handler = async (event) => {
 Processes deletion tasks for DELETE SQL operations. Retrieves query results from Athena and performs complete cleanup of both DynamoDB items and S3 Parquet files.
 
 ```javascript
-// Pattern: OCG-{project}-{hash} (hash from: {project}-deletion-listener)
-// Example: OCG-blog-o3p4q5r6s7t8u9v0
+// Pattern: OCG-{project}-deletion-listener (no hash - created once per project)
+// Example: OCG-blog-deletion-listener
 
 const {
   AthenaClient,
@@ -1299,9 +1313,10 @@ This ensures that when you delete a `User`, all related join table entries (like
 
 - The framework uses **deterministic relation IDs** to prevent duplicate inserts
 - Relation IDs are generated by:
-  1. Sorting entity mappings alphabetically by entity type and value
-  2. Creating a string: `entityType1:value1|entityType2:value2|...`
-  3. Hashing with SHA-256 and taking the first 32 characters
+  1. Including the table name to prevent collisions across different join tables
+  2. Sorting entity mappings alphabetically by entity type and value
+  3. Creating a string: `tableName|entityType1:value1|entityType2:value2|...`
+  4. Hashing with SHA-256 and taking the first 32 characters
 - Before creating a new relation, the system checks if `joinTableData#<relationId>` already exists
 - If it exists, returns the existing relation data (prevents duplicate Parquet files and DynamoDB items)
 - If it doesn't exist, creates a new relation with conditional put to handle race conditions

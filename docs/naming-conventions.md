@@ -38,7 +38,10 @@ Example: OcGraphql-my-blog-api
 
 ### Lambda Functions
 
-**Note:** Lambda function names use a hash-based pattern to avoid AWS's 64-character limit. The hash is generated from the full function identifier and truncated to 16 characters.
+Lambda function names use different patterns depending on the function type:
+
+**Hash-Based Naming (for CRUD, Mutations, Task Triggers, Task Results):**
+Used to avoid AWS's 64-character limit for functions that may have long names.
 
 ```
 Pattern: OCG-{project}-{hash}
@@ -48,19 +51,31 @@ Examples:
 - OCG-blog-a1b2c3d4e5f6g7h8 (for blog-create-user)
 - OCG-blog-i9j0k1l2m3n4o5p6 (for blog-mutation-likePost)
 - OCG-blog-q7r8s9t0u1v2w3x4 (for blog-query-taskResultGetUsersByCity)
-- OCG-blog-y5z6a7b8c9d0e1f2 (for blog-stream-processor)
+```
+
+**Descriptive Naming (for project-level functions):**
+Used for functions created once per project that won't hit the 64-character limit.
+
+```
+Pattern: OCG-{project}-{function-name}
+
+Examples:
+- OCG-blog-stream-processor
+- OCG-blog-cascade-deletion-listener
+- OCG-blog-deletion-listener
+- OCG-blog-athena-execution-tracker
 ```
 
 **Function Categories:**
 
-- CRUD: `{project}-{operation}-{entity}` (e.g., `blog-create-user`)
-- Mutations: `{project}-mutation-{mutationName}` (e.g., `blog-mutation-likePost`)
-- Task Triggers: `{project}-mutation-triggerTask{QueryName}` (e.g., `blog-mutation-triggerTaskGetUsersByCity`)
-- Task Results: `{project}-query-taskResult{QueryName}` (e.g., `blog-query-taskResultGetUsersByCity`)
-- Stream Processor: `{project}-stream-processor`
-- Cascade Deletion Listener: `{project}-cascade-deletion-listener`
-- Deletion Listener: `{project}-deletion-listener`
-- Athena Execution Tracker: `{project}-athena-execution-tracker`
+- CRUD: `{project}-{operation}-{entity}` (e.g., `blog-create-user`) → Hash-based
+- Mutations: `{project}-mutation-{mutationName}` (e.g., `blog-mutation-likePost`) → Hash-based
+- Task Triggers: `{project}-mutation-triggerTask{QueryName}` (e.g., `blog-mutation-triggerTaskGetUsersByCity`) → Hash-based
+- Task Results: `{project}-query-taskResult{QueryName}` (e.g., `blog-query-taskResultGetUsersByCity`) → Hash-based
+- Stream Processor: `OCG-{project}-stream-processor` → Descriptive (no hash)
+- Cascade Deletion Listener: `OCG-{project}-cascade-deletion-listener` → Descriptive (no hash)
+- Deletion Listener: `OCG-{project}-deletion-listener` → Descriptive (no hash)
+- Athena Execution Tracker: `OCG-{project}-athena-execution-tracker` → Descriptive (no hash)
 
 ### DynamoDB Resources
 
