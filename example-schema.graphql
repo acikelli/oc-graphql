@@ -1,0 +1,85 @@
+scalar AWSDateTime
+
+type Query {
+  getUsersByCity(city: String!): [UserTaskResponse]
+    @sql_query(
+      query: "SELECT u.*, COUNT(*) OVER() AS total FROM user u JOIN address a ON u.id = a.userId WHERE a.city = $args.city"
+    )
+  getUserFavoriteProducts(userId: String!): [ProductTaskResponse]
+    @sql_query(
+      query: "SELECT * FROM product p JOIN user_favorite_products ufp ON p.id = ufp.productId WHERE ufp.userId = $args.userId"
+    )
+}
+
+type Mutation {
+  addProductToFavorite(userId: ID!, productId: ID!)
+    @sql_query(
+      query: "INSERT INTO $join_table(user_favorite_products) (userId:User, productId:Product) VALUES ($args.userId, $args.productId)"
+    )
+  removeProductFromFavorite(productId: ID!)
+    @sql_query(
+      query: "DELETE ufp FROM $join_table(user_favorite_products) ufp WHERE ufp.productId = $args.productId;"
+    )
+  removeBrandFromFavorites(brandId: ID!)
+    @sql_query(
+      query: "DELETE ufp FROM $join_table(user_favorite_products) ufp INNER JOIN product p ON ufp.productId = p.id WHERE p.brandId = $args.brandId;"
+    )
+}
+
+type UserTaskResponse @task_response {
+  id: ID!
+  name: String!
+  email: String!
+  password: String!
+  createdAt: AWSDateTime!
+  updatedAt: AWSDateTime!
+  total: Int!
+} 
+
+
+type Address {
+  id: ID!
+  userId: ID!
+  city: String!
+  state: String!
+  zip: String!
+  country: String!
+  addressLine1: String!
+  addressLine2: String!
+  createdAt: AWSDateTime!
+  updatedAt: AWSDateTime!
+}
+
+type Brand {
+  id: ID!
+  name: String!
+  createdAt: AWSDateTime!
+  updatedAt: AWSDateTime!
+}
+
+type ProductTaskResponse @task_response {
+  id: ID!
+  name: String!
+  brandId: ID!
+  price: Float!
+  createdAt: AWSDateTime!
+  updatedAt: AWSDateTime!
+}
+
+type Product {
+  id: ID!
+  name: String!
+  brandId: ID!
+  price: Float!
+  createdAt: AWSDateTime!
+  updatedAt: AWSDateTime!
+}
+
+type User {
+  id: ID!
+  name: String!
+  email: String!
+  password: String!
+  createdAt: AWSDateTime!
+  updatedAt: AWSDateTime!
+}
