@@ -95,21 +95,21 @@ type User {
 
 After deploying our schema, a new API named `demo-api` is created on AWS AppSync.
 
-![Alt text](./docs/images/1_AU5xAxp0kT1gv7Q3OHKNlg.webp)
+![Alt text](./images/1_AU5xAxp0kT1gv7Q3OHKNlg.webp)
 
 For each object type defined in the schema, create/delete/update mutations and read queries created automatically. For each operation, a Lambda data source gets created and connected to the corresponding Query and Mutation APIs. Lets start investigating `createUser` mutation first.
 
-![Alt text](./docs/images/1_Sjsxx4nayDJT4K6oVd7oSg.webp)
+![Alt text](./images/1_Sjsxx4nayDJT4K6oVd7oSg.webp)
 
 We called the `createUser` mutation with the `name` argument contains [contains 120KB of text](https://gist.github.com/acikelli/8dff53e71456ad80f1917f96dcdadf9c).
 
 Now lets check S3 bucket that's been created per project that stores all of the data.
 
-![Alt text](./docs/images/1_xayWzjeLfhvjHGPBgrTWXg.webp)
+![Alt text](./images/1_xayWzjeLfhvjHGPBgrTWXg.webp)
 
 A parquet file with the name of the unique `userId` is saved to the S3 bucket. Notice that even though our input data's `name` argument is 120KB in size, the parquet file is only 9KB in size(considering parquet metadata contains some 3KB alone). The compression is automatically done by the framework.
 
-![Alt text](./docs/images/1_pL9T0yMeViPJv_Px6iqUrQ.webp)
+![Alt text](./images/1_pL9T0yMeViPJv_Px6iqUrQ.webp)
 
 Under the hood, `createUser` mutation is connected to a Lambda data source that has been created for the mutation. The connected data source Lambda creates an unique ID for the user and saves the user item to the DynamoDB. Then returns response to the mutation.
 
@@ -138,7 +138,7 @@ After the item is saved, another Lambda listens the streams from the DynamoDB ta
 
 Lets check the created database on Glue.
 
-![Alt text](./docs/images/1_p0ZoVVq39rTyH3r5MAE5pA.webp)
+![Alt text](./images/1_p0ZoVVq39rTyH3r5MAE5pA.webp)
 
 A Glue database is created per project with the name `<project_name>_db`. The framework automatically detects each object type defined in the provided GraphQL schema and creates the corresponding tables and table schemas. Since the framework follows a structural pattern such as `s3://ocg-<project name>-<AWS-account-id>/tables/<entityType>/`, the stream listener Lambda uses the `entityType` attribute to store the generated Parquet file in the correct table location.
 
@@ -146,9 +146,9 @@ Notice that the Parquet file for the created user is written to `tables/user/yea
 
 Let's run some queries in Athena to verify that everything works correctly.
 
-![Alt text](./docs/images/1_BlkzzEmdNRVTJS6gV2crgQ.webp)
+![Alt text](./images/1_BlkzzEmdNRVTJS6gV2crgQ.webp)
 
-![Alt text](./docs/images/1_wyJ-xMWnAHglqzIV3nAaig.webp)
+![Alt text](./images/1_wyJ-xMWnAHglqzIV3nAaig.webp)
 
 The first query selects only the `name` field, and the scanned data size is 5.70 KB. The original size of the `name` field provided to the `createUser` mutation was 120 KB, so the compression rate is approximately 95%. The second query returns the `email` field, and the total data scanned is 0.04 KB. The size difference between the two queries demonstrates that columnar pruning also works as expected.
 
@@ -216,7 +216,7 @@ The system automatically constructs a string that starts with the table name, fo
 
 Items 2 and 3 are inserted into DynamoDB to keep track of all entities related to the relation. These items are required to support cascade deletion.
 
-![Alt text](./docs/images/1_4uCVDJP6ysqzAtvRyP6Gzg.webp)
+![Alt text](./images/1_4uCVDJP6ysqzAtvRyP6Gzg.webp)
 
 For example, when the `deleteUser` mutation is called, the connected Lambda data source deletes the corresponding entity from the database. The stream listener Lambda then detects the `REMOVE` operation performed on the database and pushes a message containing `entityType` and `entityId` information to a cascade-deletion queue (SQS) created per project.
 
@@ -251,7 +251,7 @@ INNER JOIN product p ON ufp.productId = p.id
 WHERE p.brandId = $args.brandId;
 ```
 
-![Alt text](./docs/images/1_4nYy3uKRpKR21wO9Y501aw.webp)
+![Alt text](./images/1_4nYy3uKRpKR21wO9Y501aw.webp)
 
 Notice that the actual API created in AppSync does not include a mutation named `removeBrandFromFavorites`. AppSync has a 30-second timeout limit, while queries executed on Athena may take significantly longer.
 
@@ -260,7 +260,7 @@ To address this, the framework automatically converts mutations and queries anno
 1. **one mutation** (named `triggerTask{OriginalMutationOrQueryName}`) that returns the created task ID, and
 2. **one query** (named `taskResult{OriginalMutationOrQueryName}`) that allows tracking the task result asynchronously.
 
-![Alt text](./docs/images/1_xayWzjeLfhvjHGPBgrTWXa.webp)
+![Alt text](./images/1_xayWzjeLfhvjHGPBgrTWXa.webp)
 
 Once the `triggerTaskRemoveBrandFromFavorites` mutation is called, its connected data source lambda runs the transformed query on Athena and saves a task entity to the database as below.
 
@@ -290,7 +290,7 @@ The response type of `Query.getUserFavoriteProducts`, `ProductTaskResponse`, is 
 
 Lets trigger a task and query its result.
 
-![Alt text](./docs/images/1_OSBjGEaIHOlhf2LOOY05sg.gif)
+![Alt text](./images/1_OSBjGEaIHOlhf2LOOY05sg.gif)
 
 We first called the `triggerTaskGetUserFavoriteProducts` mutation, which returned a task ID. We then called the `taskResultGetUserFavoriteProducts` query using the obtained task ID. The first call to this query returned `status: RUNNING` and `result: null`.
 
