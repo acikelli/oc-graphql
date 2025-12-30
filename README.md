@@ -1,10 +1,8 @@
 # OC-GraphQL
 
-**A serverless GraphQL framework for AWS** - Automatically generate and deploy production-ready GraphQL APIs with advanced analytics capabilities.
+**oc-graphql** is a serverless GraphQL analytics framework built on AWS that automatically handles CRUD operations, data partitioning and compression while enabling raw SQL queries through your GraphQL API. The framework simplifies analytics integration by introducing just two custom directives — `@sql_query` and `@task_result` — with all the complex infrastructure managed automatically behind the scenes.
 
-OC-GraphQL is an open-source framework that abstracts AWS infrastructure complexity, automatically generating and deploying complete serverless GraphQL applications. Transform your GraphQL schema into a production-ready infrastructure with real-time data analytics powered by Apache Parquet storage for 90-98% cost reduction and 50-100x faster queries, all with a single command.
-
-**[Read Medium Story](https://medium.com/@acikelli/how-to-design-a-serverless-graphql-analytics-framework-on-aws-b6b5122436f6)**
+**[Read How It Works](./docs/how-it-works.md)**
 
 ## Key Features
 
