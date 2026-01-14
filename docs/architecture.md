@@ -251,8 +251,6 @@ DynamoDB Stream Event → Python Lambda → Schema-Based Type Enforcement → Pa
 7. **Automatic Cleanup**: Deletes temporary `joinTableData` items synchronously after Parquet write
 8. **Cascade Deletion**: Sends SQS messages for entity deletions to trigger join table cleanup
 
-**Note:** Glue tables are created during CDK deployment via Custom Resource Lambda, not by the stream processor. This eliminates expensive S3 ListBucket operations that were triggered by `glue_client.get_table()` calls.
-
 #### Supported Operations
 
 ```python

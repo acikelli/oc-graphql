@@ -820,9 +820,6 @@ def handle_join_table_data_item(item, year, month, day, event_name):
     df = create_dataframe_from_item(item, join_table_name=join_table)
     write_parquet_to_s3(df, s3_key)
 
-    # Glue tables are now created during CDK deployment, no need to check/create here
-    # This eliminates expensive S3 ListBucket operations
-
     # Delete the temporary joinTableData item after processing
     try:
         import boto3.dynamodb.conditions as conditions
@@ -865,8 +862,6 @@ def handle_regular_entity_item(item, entity_type, year, month, day, event_name):
     df = create_dataframe_from_item(item, entity_type=entity_type)
     write_parquet_to_s3(df, s3_key)
 
-    # Glue tables are now created during CDK deployment, no need to check/create here
-    # This eliminates expensive S3 ListBucket operations
 
 def create_dataframe_from_item(item, entity_type=None, join_table_name=None):
     """Convert DynamoDB item to pandas DataFrame with proper type handling based on GraphQL schema"""
@@ -1098,7 +1093,6 @@ def format_date_parts(date_obj):
 - **Ultra-Minimal Parquet Schema**: Uses smallest possible data types for maximum compression
 - **Error Resilience**: Continues processing other records if one fails
 - **Cascade Deletion**: Sends SQS messages for entity deletions to trigger join table cleanup
-- **No Glue API Calls**: Glue tables are created during CDK deployment - eliminates expensive S3 ListBucket operations
 
 ### 7. Cascade Deletion Listener (Node.js 18.x)
 

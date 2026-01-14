@@ -2,49 +2,7 @@
 
 **oc-graphql** is a serverless GraphQL analytics framework built on AWS that automatically handles CRUD operations, data partitioning and compression while enabling raw SQL queries through your GraphQL API. The framework simplifies analytics integration by introducing just two custom directives — `@sql_query` and `@task_result` — with all the complex infrastructure managed automatically behind the scenes.
 
-**[Read How It Works](./docs/how-it-works.md)**
-
-## Key Features
-
-### **Automatic CRUD Generation**
-
-- Zero-config database operations for all GraphQL types
-- Single-table DynamoDB design with optimized key structure
-- Auto-generated Lambda functions with built-in security
-
-### **SQL-First Analytics**
-
-- Direct SQL queries in GraphQL with `@sql_query` directive
-- Complex joins and aggregations via Amazon Athena
-- Join tables for many-to-many relationships
-
-### **Advanced Data Pipeline**
-
-- **Real-time Processing**: DynamoDB Streams → Python Processor → Parquet S3
-- **Native Parquet Storage**: Apache Parquet with SNAPPY compression for optimal performance
-- **Intelligent Type Detection**: Automatic timestamp, numeric, and string optimization
-- **Date Partitioning**: Automatic year/month/day partitioning for optimal query performance
-- **Cost Optimization**: 90-98% storage reduction and 99% query cost reduction
-
-### **Security**
-
-- Built-in SQL injection protection with automatic parameter sanitization
-- IAM role-based access control with least privilege principle
-
-### **Performance & Cost **
-
-- **Storage**: 90-98% smaller files vs traditional JSON approaches
-- **Query Speed**: 50-100x faster analytics with columnar Parquet format
-- **Query Cost**: 99% cost reduction through partition pruning and column pruning
-
-## Complete Documentation
-
-- **[Architecture Overview](./docs/architecture.md)** - System design and component relationships
-- **[Naming Conventions](./docs/naming-conventions.md)** - Resource naming patterns and standards
-- **[Storage Format](./docs/storage-format.md)** - Parquet optimization and compression strategies
-- **[Schema Design](./docs/schema-design.md)** - GraphQL patterns and custom directives
-- **[Lambda Functions](./docs/lambda-functions.md)** - Generated function types and patterns
-- **[Security Features](./docs/security.md)** - SQL injection protection and access control
+**[How It Works](./docs/how-it-works.md)**
 
 ## 🚀 Quick Start
 
@@ -125,6 +83,48 @@ npm run build
 
 node dist/cli.js deploy -n demo  -f ./schema.graphql
 ```
+
+## Key Features
+
+### **Automatic CRUD Generation**
+
+- Zero-config database operations for all GraphQL types
+- Single-table DynamoDB design with optimized key structure
+- Auto-generated Lambda functions with built-in security
+
+### **SQL-First Analytics**
+
+- Direct SQL queries in GraphQL with `@sql_query` directive
+- Complex joins and aggregations via Amazon Athena
+- Join tables for many-to-many relationships
+
+### **Advanced Data Pipeline**
+
+- **Real-time Processing**: DynamoDB Streams → Python Processor → Parquet S3
+- **Native Parquet Storage**: Apache Parquet with SNAPPY compression for optimal performance
+- **Intelligent Type Detection**: Automatic timestamp, numeric, and string optimization
+- **Date Partitioning**: Automatic year/month/day partitioning for optimal query performance
+- **Cost Optimization**: 90-98% storage reduction and 99% query cost reduction
+
+### **Security**
+
+- Built-in SQL injection protection with automatic parameter sanitization
+- IAM role-based access control with least privilege principle
+
+### **Performance & Cost**
+
+- **Storage**: 90-98% smaller files vs traditional JSON approaches
+- **Query Speed**: 50-100x faster analytics with columnar Parquet format
+- **Query Cost**: 99% cost reduction through partition pruning and column pruning
+
+## Complete Documentation
+
+- **[Architecture Overview](./docs/architecture.md)** - System design and component relationships
+- **[Naming Conventions](./docs/naming-conventions.md)** - Resource naming patterns and standards
+- **[Storage Format](./docs/storage-format.md)** - Parquet optimization and compression strategies
+- **[Schema Design](./docs/schema-design.md)** - GraphQL patterns and custom directives
+- **[Lambda Functions](./docs/lambda-functions.md)** - Generated function types and patterns
+- **[Security Features](./docs/security.md)** - SQL injection protection and access control
 
 ## 🔧 Architecture Highlights
 

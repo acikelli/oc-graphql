@@ -674,9 +674,6 @@ CASCADE_DELETION_QUEUE_URL = os.environ.get('CASCADE_DELETION_QUEUE_URL')
 SCHEMA_MAPPING = ${JSON.stringify(schemaMapping, null, 2)}
 JOIN_TABLE_SCHEMAS = ${JSON.stringify(joinTableSchemas, null, 2)}
 
-# Glue tables are now created during CDK deployment - no Glue client needed here
-# This eliminates expensive S3 ListBucket operations
-
 def lambda_handler(event, context):
     """Main Lambda handler for DynamoDB stream processing"""
     for record in event['Records']:
@@ -837,8 +834,6 @@ def handle_join_table_data_item(item, year, month, day, event_name):
     df = create_dataframe_from_item(item, join_table_name=join_table)
     write_parquet_to_s3(df, s3_key)
     
-    # Glue tables are now created during CDK deployment, no need to check/create here
-    # This eliminates expensive S3 ListBucket operations
     
     # Delete the temporary joinTableData item after processing
     # This must happen synchronously to ensure cleanup
@@ -883,8 +878,6 @@ def handle_legacy_join_table_item(item, year, month, day, event_name):
     df = create_dataframe_from_item(item, join_table_name=join_table)
     write_parquet_to_s3(df, s3_key)
     
-    # Glue tables are now created during CDK deployment, no need to check/create here
-    # This eliminates expensive S3 ListBucket operations
 
 def handle_regular_entity_item(item, entity_type, year, month, day, event_name):
     """Handle regular entity items with date partitioning"""
@@ -898,8 +891,6 @@ def handle_regular_entity_item(item, entity_type, year, month, day, event_name):
     df = create_dataframe_from_item(item, entity_type=entity_type)
     write_parquet_to_s3(df, s3_key)
     
-    # Glue tables are now created during CDK deployment, no need to check/create here
-    # This eliminates expensive S3 ListBucket operations
 
 def create_dataframe_from_item(item, entity_type=None, join_table_name=None):
     """Convert DynamoDB item to pandas DataFrame with proper type handling based on GraphQL schema"""
@@ -1065,10 +1056,6 @@ def write_parquet_to_s3(df, s3_key):
         logger.error(f"Error writing Parquet to S3: {str(e)}")
         raise
 
-# Glue tables are now created during CDK deployment based on GraphQL schema
-# This eliminates expensive S3 ListBucket operations that were triggered by
-# glue_client.get_table() calls in the stream processor
-# The stream processor now only writes Parquet files - no Glue API calls needed
 
 def infer_glue_type_from_dataframe(df, column_name):
     """Infer Glue data type from DataFrame column dtype"""
